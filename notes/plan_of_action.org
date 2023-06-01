@@ -1,0 +1,9 @@
+* Approach to take
+- use the api to parse the data.
+  Reference : https://cmake.org/cmake/help/latest/manual/cmake-file-api.7.html
+  Things to do :
+  - [ ] Find out the things to query for
+  - [ ] add support to write the query files when configuring the project
+  - [ ] Parse the reply to load all the available targets
+  - [ ] Add option to choose which target to build
+  - [ ] Add option to run the target and output the data to a separate buffer
