@@ -8,10 +8,51 @@
   - [ ] Add option to choose which target to build
   - [ ] Add option to run the target and output the data to a separate buffer
 
+* Features to support
+This is just an initial list of things I can think of. This can keep on growing as more things are required
+                                         | Feature                                   | Status | Comments |
+                                         |-------------------------------------------+--------+----------|
+                                         | Configure the things to setup the project |        |          |
+                                         | Write the query.json for generating data  |        |          |
+                                         | Configure the project                     |        |          |
+                                         | Build the project                         |        |          |
+                                         | Add support for cmake presets             |        |          |
+
+* Notes for emacs plugins
+** Define custom variables
+To allow users of this plugin to override values like the cmake binary / build directory etc we can use ~defcustom~ macro.
+#+begin_src elisp
+(defcustom ect/cmake-binary "cmake"
+  "Path of the binary used for cmake"
+  :type 'string
+  :group 'emacs-cmake-tools)
+#+end_src
+
 * CMAKE File API
 - We can use client stateful api to generate the data we need to parse. The majore requirement to do that is to create a query.json file in the build directory in the path
   #+begin_src
 <build-directory>/.cmake/api/v1/client-emacs-cmake-tools/query.json
   #+end_src
-
   here ~client-emacs-cmake-tools~ is the special identifier to not interfere with other clients
+
+  We can use ~json-encode~ with ~with-temp-file~ to publish the data to the required path.
+
+  Queries that needs to be written to the file :
+  - code model v2
+    - This will generate a master index file -> code model file -> per target code model. We can use this to create a model for each target and use it for things like run program
+
+* Assumptions
+- In the initial version we are assuming that projectile is available. To get the project root we ll use the projectile helpers. Maybe provide an option to provide acustom function to override the way to provide the project root ?
+
+* Features
+** Configure the things to setup the project
+- cmake binary : Ability to setup the cmake binary. Default value ~cmake~.
+- cmake build type : Ability to setup the build type. Default value ~Debug~.
+- build directory prefix : Prefix of the build directory. Mimicing the behavior of ide like clion, we ll setup the build directory as <build directory prefix>-<smallercase(build type)>. Default value is ~build~. Also a function to return this value for the clients. This can be used to point the lsp to use the build directory to find compilation database.
+- generate compile commands : Toggle to enable and disable generating compile commands. Default value ~false~.
+- cmake configure arguments : Arguments for configuring project using cmake. Default value ~""~
+- cmake build arguments : Arguments for building the project using cmake. Default value ~""~
+- generator : Argument to set the generator. Initially supporting ~Makefile~ and ~Ninja~. Default value is ~Makefile~. If provided with any value outside the above values, default value will be used
+
+** Write the query.json for generating build metadata
+Use json package with json-encode function to create the query for generating code model
