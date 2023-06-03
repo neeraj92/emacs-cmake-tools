@@ -27,6 +27,12 @@ To allow users of this plugin to override values like the cmake binary / build d
   :type 'string
   :group 'emacs-cmake-tools)
 #+end_src
+** Compile buffer
+For a custom command to appear in the compilation buffer, we can use the ~compile~ function in elisp.
+#+begin_src elisp
+;;; this will run the confgure command as epxected in the *compilation* buffer
+(compile configure_cmd)
+#+end_src
 
 * CMAKE File API
 - We can use client stateful api to generate the data we need to parse. The majore requirement to do that is to create a query.json file in the build directory in the path
