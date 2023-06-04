@@ -8,12 +8,6 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
-;;; Variable to set the current build type
-(defcustom ect/cmake-build-type "Debug"
-  "Build type to be used for configuring and building projects."
-  :type 'string
-  :group 'emacs-cmake-tools)
-
 ;;; Variable to set the build directory prefix
 ;;; Currently only supports a relative path inside the project directory
 (defcustom ect/cmake-build-directory-prefix "build"
@@ -45,10 +39,24 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
-(defun ect/cmake-generate-configure-command ()
+;;; Variable to represent the different build types
+(defcustom ect/cmake-build-types '("Release" "Debug" "RelWithDebInfo")
+ "List of available build types"
+ :type '(repeat strings)
+ :group 'emacs-cmake-tools)
+
+(setq ect/local-cmake-build-type "Release")
+
+(defun ect/cmake-generate-configure-command (build-directory)
   "Helper function for generating the configure command."
-  (setq configure_cmd (concat ect/cmake-binary " -S " (projectile-project-root) " -B build -DCMAKE_BUILD_TYPE=Debug"))
+  (setq configure_cmd (concat ect/cmake-binary " -S " (projectile-project-root) " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type))
   configure_cmd)
+
+(defun ect/cmake-choose-build-type ()
+  "Helper function to choose the build type"
+  (interactive)
+  (setq ect/local-cmake-build-type (completing-read "Choose build type :" ect/cmake-build-types))
+  )
 
 (defun ect/cmake-generate-write-query-file (build-directory)
   "Helper function which will generate the query file for cmake."
@@ -69,9 +77,10 @@
   "Configure cmake project."
   (interactive)
   (let ((default-directory (projectile-project-root)))
-    (setq cmake-build-directory (concat (projectile-project-root) "/build"))
-  ;;  (message "cmake build dir : %s" cmake-build-directory)
-    (setq configure_cmd (ect/cmake-generate-configure-command))
+    (setq build-directory-suffix (downcase ect/local-cmake-build-type))
+    (setq build-directory (concat ect/cmake-build-directory-prefix "-" build-directory-suffix))
+    (setq cmake-build-directory (concat (projectile-project-root) "/" build-directory))
+    (setq configure_cmd (ect/cmake-generate-configure-command build-directory))
     (ect/cmake-generate-write-query-file cmake-build-directory)
     (compile configure_cmd)))
 
