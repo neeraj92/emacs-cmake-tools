@@ -45,6 +45,17 @@
   :type '(repeat strings)
   :group 'emacs-cmake-tools)
 
+(defcustom ect/cmake-generators '("Ninja" "Unix Makefiles")
+  "List of supported generators."
+  :type '(repeat strings)
+  :group 'emacs-cmake-tools)
+
+(defcustom ect/cmake-current-generator "Ninja"
+  "Current cmake generator."
+  :type 'string
+  :group 'emacs-cmake-tools)
+
+
 (defcustom ect/cmake-targets '("All")
   "List of targets for the project."
   :type '(repeat strings)
@@ -63,7 +74,7 @@
 
 (defun ect/cmake-generate-configure-command (build-directory)
   "Helper function for generating the configure command."
-  (setq configure_cmd (concat ect/cmake-binary " -S " (projectile-project-root) " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type))
+  (setq configure_cmd (concat ect/cmake-binary " -S " (projectile-project-root) " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator))
   configure_cmd)
 
 (defun ect/cmake-generate-build-command (build-directory)
@@ -80,7 +91,13 @@
 (defun ect/cmake-build-target ()
   "Helper function to narrow down the build to a specific target."
   (interactive)
-  (setq ect/cmake-current-target (completing-read "Choose targbet :" ect/cmake-targets))
+  (setq ect/cmake-current-target (completing-read "Choose target :" ect/cmake-targets))
+  )
+
+(defun ect/cmake-generator ()
+  "Helper function to set the cmake generator value."
+  (interactive)
+  (setq ect/cmake-current-generator (completing-read "Choose generator :" ect/cmake-generators))
   )
 
 (defun ect/cmake-generate-write-query-file (build-directory)
@@ -158,7 +175,7 @@
   )
 
 (defun ect/cmake-build-project ()
-  "build the project"
+  "Build the project"
   (interactive)
   (let ((default-directory (projectile-project-root)))
     (setq build-directory-suffix (downcase ect/local-cmake-build-type))
