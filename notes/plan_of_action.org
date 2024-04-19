@@ -1,22 +1,19 @@
 * Approach to take
 - use the api to parse the data.
   Reference : https://cmake.org/cmake/help/latest/manual/cmake-file-api.7.html
-  Things to do :
-  - [ ] Find out the things to query for
-  - [ ] add support to write the query files when configuring the project
-  - [ ] Parse the reply to load all the available targets
-  - [ ] Add option to choose which target to build
-  - [ ] Add option to run the target and output the data to a separate buffer
 
 * Features to support
 This is just an initial list of things I can think of. This can keep on growing as more things are required
-                                         | Feature                                   | Status | Comments |
-                                         |-------------------------------------------+--------+----------|
-                                         | Configure the things to setup the project |        |          |
-                                         | Write the query.json for generating data  |        |          |
-                                         | Configure the project                     |        |          |
-                                         | Build the project                         |        |          |
-                                         | Add support for cmake presets             |        |          |
+                                         | Feature                                   | Status | Comments                                                |
+                                         |-------------------------------------------+--------+---------------------------------------------------------|
+                                         | Configure the things to setup the project | Done   |                                                         |
+                                         | Write the query.json for generating data  | Done   |                                                         |
+                                         | Configure the project                     | Done   |                                                         |
+                                         | Build the project                         | Done   |                                                         |
+                                         | Add support for cmake presets             |        |                                                         |
+                                         | Add support to choose the build target    | Done   | There is no support for caching this data at the moment |
+                                         | Add support for choosing the generators   |        |                                                         |
+                                         | Add support for running the target        |        |                                                         |
 
 * Notes for emacs plugins
 ** Define custom variables
