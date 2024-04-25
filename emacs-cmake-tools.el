@@ -72,9 +72,21 @@
   :group 'emacs-cmake-tools
   )
 
+(defcustom ect/cmake-source-directory nil
+  "Source directory to use for the build."
+  :type 'string
+  :group 'emacs-cmake-tools)
+
+(defvar ect/project-config-file ".ect.json"
+  "Custom config file for the project which is expected in the project root. If not present in project root, this will be created.")
+
+(defvar ect/project-settings (make-hash-table :test 'equal)
+  "Local project settings so that it doesnt have to be configured every time.")
+
 (defun ect/cmake-generate-configure-command (build-directory)
   "Helper function for generating the configure command."
-  (setq configure_cmd (concat ect/cmake-binary " -S " (projectile-project-root) " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator))
+
+  (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator))
   configure_cmd)
 
 (defun ect/cmake-generate-build-command (build-directory)
@@ -148,6 +160,7 @@
 (defun ect/cmake-api-output (build-directory)
   "Function to parse the output of cmake api"
   (setq api_file (ect/find-latest-file-by-pattern (concat build-directory "/.cmake/api/v1/reply") "^index.*\\.json$"))
+  (message "Opening api file : %s" api_file)
   (with-temp-buffer
     (insert-file-contents api_file)
     (setq cmake_index (json-parse-buffer :object-type 'hash-table)))
@@ -159,6 +172,7 @@
 
 
   (setq ect_cm_path (concat build-directory "/.cmake/api/v1/reply/" ect_cm))
+  (message "Opening codemodels file : %s" ect_cm_path)
   (with-temp-buffer
     (insert-file-contents ect_cm_path)
     (setq ect_cm_contents (json-parse-buffer :object-type 'hash-table)))
@@ -171,11 +185,11 @@
     )
 
   (setq ect/cmake-targets targets)
-  (message "Cmake targets : %s" ect/cmake-targets)
+  ;;  (message "Cmake targets : %s" ect/cmake-targets)
   )
 
 (defun ect/cmake-build-project ()
-  "Build the project"
+  "Build the project."
   (interactive)
   (let ((default-directory (projectile-project-root)))
     (setq build-directory-suffix (downcase ect/local-cmake-build-type))
@@ -188,6 +202,53 @@
           (message "Updated target : %s " build_cmd))
       )
     (compile build_cmd))
+  )
+
+(defun ect/save-project-settings ()
+  "Save the project level settings."
+  (interactive)
+  (puthash "project-source-directory" ect/cmake-source-directory ect/project-settings)
+  (puthash "current-target" ect/cmake-current-target ect/project-settings)
+  (puthash "generator" ect/cmake-current-generator ect/project-settings)
+  (let ((json-project-settings (json-encode ect/project-settings)))
+    (write-region json-project-settings nil ect/project-config-file))
+  )
+
+(defun ect/load-project-settings ()
+  "Load the project level settings."
+  (interactive)
+  (with-temp-buffer
+    (insert-file-contents ect/project-config-file)
+    (setq ect/project-settings (json-parse-buffer :object-type 'hash-table)))
+
+  (setq ect/cmake-source-directory (gethash "project-source-directory" ect/project-settings))
+  (let ((value (gethash "current-target" ect/project-settings)))
+    (when value
+      (setq ect/cmake-current-target value)
+      t))
+
+  (let ((value (gethash "generator" ect/project-settings)))
+    (when value
+      (setq ect/cmake-current-generator value)
+      t))
+  )
+
+(defun ect/initialize-ect ()
+  "Initialize the project level settings."
+  (interactive)
+  (let ((file-path ect/project-config-file))
+    (unless (file-exists-p file-path)
+      (setq empty-settings (json-encode (make-hash-table :test 'equal)))
+      (write-region empty-settings nil ect/project-config-file)
+      ))
+
+  (ect/load-project-settings)
+  (if (or (eq ect/cmake-source-directory 'unbound) (null ect/cmake-source-directory))
+      (progn
+        (message "initializing the project with projectile-project-root")
+        (setq ect/cmake-source-directory (projectile-project-root))))
+
+  (message "Project settings : %s" ect/project-settings)
   )
 
 
