@@ -1,5 +1,6 @@
 (require 'projectile)
 (require 'json)
+(require 'lsp)
 
 ;;; Code:
 ;;; Path to cmake binary
@@ -77,6 +78,17 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
+(defcustom ect/lsp-command-args '("-j=10" "--header-insertion=never"  "--pch-storage=memory" "--enable-config" "--clang-tidy")
+  "lsp command args"
+  :type '(repeat strings)
+  :group 'emacs-cmake-tools
+  )
+
+(defcustom ect/lsp-clangd-binary-path "clangd"
+  "lsp binary path"
+  :type 'string
+  :group 'emacs-cmake-tools)
+
 (defvar ect/project-config-file ".ect.json"
   "Custom config file for the project which is expected in the project root. If not present in project root, this will be created.")
 
@@ -94,16 +106,24 @@
   (setq build_cmd (concat ect/cmake-binary " --build " build-directory))
   build_cmd)
 
+(defun ect/project-settings-file-path ()
+  "Function to get the project settings file path"
+  (setq path-to-return (concat (projectile-project-root) "/" ect/project-config-file))
+  (message "Returning path : %s" path-to-return)
+  path-to-return)
+
 (defun ect/cmake-choose-build-type ()
   "Helper function to choose the build type."
   (interactive)
   (setq ect/local-cmake-build-type (completing-read "Choose build type :" ect/cmake-build-types))
+  (ect/save-project-settings)
   )
 
 (defun ect/cmake-build-target ()
   "Helper function to narrow down the build to a specific target."
   (interactive)
   (setq ect/cmake-current-target (completing-read "Choose target :" ect/cmake-targets))
+  (ect/save-project-settings)
   )
 
 (defun ect/cmake-generator ()
@@ -136,6 +156,8 @@
     (setq cmake-build-directory (concat (projectile-project-root) "/" build-directory))
     (setq configure_cmd (ect/cmake-generate-configure-command build-directory))
     (ect/cmake-generate-write-query-file cmake-build-directory)
+    (setq lt-clangd-compilation-commands-dir (concat "--compile-commands-dir=" cmake-build-directory))
+    (setq lsp-clients-clangd-args (cons lt-clangd-compilation-commands-dir ect/lsp-command-args))
     (compile configure_cmd)
     (ect/cmake-api-output build-directory)))
 
@@ -210,17 +232,23 @@
   (puthash "project-source-directory" ect/cmake-source-directory ect/project-settings)
   (puthash "current-target" ect/cmake-current-target ect/project-settings)
   (puthash "generator" ect/cmake-current-generator ect/project-settings)
-  (let ((json-project-settings (json-encode ect/project-settings)))
-    (write-region json-project-settings nil ect/project-config-file))
+  (puthash "build-type" ect/local-cmake-build-type ect/project-settings)
+  (let ((json-project-settings (json-encode ect/project-settings))
+        (path-to-save (ect/project-settings-file-path)))
+    (message "Writing settings file to path %s" path-to-save)
+    (write-region json-project-settings nil path-to-save)
+    )
   )
 
 (defun ect/load-project-settings ()
   "Load the project level settings."
   (interactive)
-  (with-temp-buffer
-    (insert-file-contents ect/project-config-file)
-    (setq ect/project-settings (json-parse-buffer :object-type 'hash-table)))
-
+  (let ((path-to-load (ect/project-settings-file-path)))
+    (message "Loading project settings from path %s" path-to-load)
+    (with-temp-buffer
+      (insert-file-contents path-to-load)
+      (setq ect/project-settings (json-parse-buffer :object-type 'hash-table)))
+    )
   (setq ect/cmake-source-directory (gethash "project-source-directory" ect/project-settings))
   (let ((value (gethash "current-target" ect/project-settings)))
     (when value
@@ -231,15 +259,21 @@
     (when value
       (setq ect/cmake-current-generator value)
       t))
+  (let ((value (gethash "build-type" ect/project-settings)))
+    (when value
+      (setq ect/local-cmake-build-type value)
+      t))
+
   )
 
 (defun ect/initialize-ect ()
   "Initialize the project level settings."
   (interactive)
-  (let ((file-path ect/project-config-file))
+  (let ((file-path (ect/project-settings-file-path)))
     (unless (file-exists-p file-path)
+      (message "Creating empty file at path %s" file-path)
       (setq empty-settings (json-encode (make-hash-table :test 'equal)))
-      (write-region empty-settings nil ect/project-config-file)
+      (write-region empty-settings nil file-path)
       ))
 
   (ect/load-project-settings)
@@ -247,9 +281,10 @@
       (progn
         (message "initializing the project with projectile-project-root")
         (setq ect/cmake-source-directory (projectile-project-root))))
-
-  (message "Project settings : %s" ect/project-settings)
+  (setq lsp-clangd-binary-path ect/lsp-clangd-binary-path)
+  (message "Setting clangd binary path : %s" lsp-clangd-binary-path)
   )
+
 
 
 (provide 'emacs-cmake-tools)

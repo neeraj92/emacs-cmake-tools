@@ -14,6 +14,8 @@ This is just an initial list of things I can think of. This can keep on growing 
                                          | Add support to choose the build target    | Done   | There is no support for caching this data at the moment |
                                          | Add support for choosing the generators   |        |                                                         |
                                          | Add support for running the target        |        |                                                         |
+                                         | Add support for running a specific test   |        |                                                         |
+                                         |                                           |        |                                                         |
 
 * Notes for emacs plugins
 ** Define custom variables
@@ -59,3 +61,4 @@ For a custom command to appear in the compilation buffer, we can use the ~compil
 
 ** Write the query.json for generating build metadata
 Use json package with json-encode function to create the query for generating code model
+** For tests, figure out a way to get the test names, and then list them for running. Have ability to configure the working directory and the arguments.
