@@ -9,6 +9,11 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
+(defcustom ect/ctest-binary "ctest"
+  "Path of the binary used for ctest"
+  :type 'string
+  :group 'emacs-cmake-tools)
+
 ;;; Variable to set the build directory prefix
 ;;; Currently only supports a relative path inside the project directory
 (defcustom ect/cmake-build-directory-prefix "build"
@@ -89,6 +94,19 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
+(defcustom ect/ctest-args '()
+  "args for ctest"
+  :type '(repeat strings)
+  :group 'emacs-cmake-tools
+  )
+
+(defvar ect/project-cmake-configure-args ""
+  "Custom configuration for cmake configure on the project level.")
+
+(defvar ect/project-cmake-build-args ""
+  "Custom configuration for cmake build on the project level.")
+
+
 (defvar ect/project-config-file ".ect.json"
   "Custom config file for the project which is expected in the project root. If not present in project root, this will be created.")
 
@@ -98,13 +116,18 @@
 (defun ect/cmake-generate-configure-command (build-directory)
   "Helper function for generating the configure command."
 
-  (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator))
+  (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator " " ect/project-cmake-configure-args))
   configure_cmd)
 
 (defun ect/cmake-generate-build-command (build-directory)
   "Helper function to gernrate the build command."
-  (setq build_cmd (concat ect/cmake-binary " --build " build-directory))
+  (setq build_cmd (concat ect/cmake-binary " --build " build-directory " " ect/project-cmake-build-args))
   build_cmd)
+
+(defun ect/ctest-generate-command (build-directory)
+  "Helpers function to generate ctest command"
+  (setq test_cmd (concat ect/ctest-binary " --test-dir " build-directory  " "  ect/ctest-args))
+  test_cmd)
 
 (defun ect/project-settings-file-path ()
   "Function to get the project settings file path"
@@ -223,6 +246,7 @@
           (setq build_cmd (concat build_cmd " --target " ect/cmake-current-target))
           (message "Updated target : %s " build_cmd))
       )
+    ;;(setq build_cmd (concat build_cmd " -- -j10"))
     (compile build_cmd))
   )
 
@@ -233,6 +257,8 @@
   (puthash "current-target" ect/cmake-current-target ect/project-settings)
   (puthash "generator" ect/cmake-current-generator ect/project-settings)
   (puthash "build-type" ect/local-cmake-build-type ect/project-settings)
+  (puthash "project-cmake-configure-args" ect/project-cmake-configure-args ect/project-settings)
+  (puthash "project-cmake-build-args" ect/project-cmake-build-args ect/project-settings)
   (let ((json-project-settings (json-encode ect/project-settings))
         (path-to-save (ect/project-settings-file-path)))
     (message "Writing settings file to path %s" path-to-save)
@@ -259,6 +285,15 @@
     (when value
       (setq ect/cmake-current-generator value)
       t))
+  (let ((value (gethash "project-cmake-configure-args" ect/project-settings)))
+    (when value
+      (setq ect/project-cmake-configure-args value)
+      t))
+  (let ((value (gethash "project-cmake-build-args" ect/project-settings)))
+    (when value
+      (setq ect/project-cmake-build-args value)
+      t))
+
   (let ((value (gethash "build-type" ect/project-settings)))
     (when value
       (setq ect/local-cmake-build-type value)
@@ -285,6 +320,35 @@
   (message "Setting clangd binary path : %s" lsp-clangd-binary-path)
   )
 
+(defun ect/run-ctest ()
+  (interactive)
+  (let ((default-directory (projectile-project-root)))
+    (setq build-directory-suffix (downcase ect/local-cmake-build-type))
+    (setq build-directory (concat ect/cmake-build-directory-prefix "-" build-directory-suffix))
+    (setq cmake-build-directory (concat (projectile-project-root) "/" build-directory))
+    (setq test_cmd (ect/ctest-generate-command build-directory))
+    (compile test_cmd))
+  )
+
+(defun ect/set-ctest-args (args)
+  "Set the arguments to be used for ctest run"
+  (interactive "sEnter the arguments: ")
+  (setq ect/ctest-args args)
+  )
+
+(defun ect/set-project-cmake-configure-args (args)
+  "Set the extra arguments to be used for project level configuration."
+  (interactive "sCmake Configure Arguments: ")
+  (setq ect/project-cmake-configure-args args)
+  (ect/save-project-settings)
+  )
+
+(defun ect/set-project-cmake-build-args (args)
+  "Set the extra arguments to be used for project level configuration."
+  (interactive "sCmake Build Arguments: ")
+  (setq ect/project-cmake-build-args args)
+  (ect/save-project-settings)
+  )
 
 
 (provide 'emacs-cmake-tools)
