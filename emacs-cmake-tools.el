@@ -46,7 +46,7 @@
   :group 'emacs-cmake-tools)
 
 ;;; Variable to represent the different build types
-(defcustom ect/cmake-build-types '("Release" "Debug" "RelWithDebInfo")
+(defcustom ect/cmake-build-types '("Release" "Debug" "RelWithDebInfo" "ReleaseShared" "DebugShared")
   "List of available build types."
   :type '(repeat strings)
   :group 'emacs-cmake-tools)
@@ -83,7 +83,7 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
-(defcustom ect/lsp-command-args '("-j=10" "--header-insertion=never"  "--pch-storage=memory" "--enable-config" "--clang-tidy")
+(defcustom ect/lsp-command-args '("-j=10" "--pch-storage=memory" "--enable-config" "--clang-tidy" "--background-index")
   "lsp command args"
   :type '(repeat strings)
   :group 'emacs-cmake-tools
@@ -121,7 +121,7 @@
 
 (defun ect/cmake-generate-build-command (build-directory)
   "Helper function to gernrate the build command."
-  (setq build_cmd (concat ect/cmake-binary " --build " build-directory " " ect/project-cmake-build-args))
+  (setq build_cmd (concat ect/cmake-binary " --build " build-directory ))
   build_cmd)
 
 (defun ect/ctest-generate-command (build-directory)
@@ -246,7 +246,7 @@
           (setq build_cmd (concat build_cmd " --target " ect/cmake-current-target))
           (message "Updated target : %s " build_cmd))
       )
-    ;;(setq build_cmd (concat build_cmd " -- -j10"))
+    (setq build_cmd (concat build_cmd  " " ect/project-cmake-build-args))
     (compile build_cmd))
   )
 
@@ -327,6 +327,7 @@
     (setq build-directory (concat ect/cmake-build-directory-prefix "-" build-directory-suffix))
     (setq cmake-build-directory (concat (projectile-project-root) "/" build-directory))
     (setq test_cmd (ect/ctest-generate-command build-directory))
+    (setq test_cmd (concat test_cmd " "  ect/ctest-args ))
     (compile test_cmd))
   )
 
