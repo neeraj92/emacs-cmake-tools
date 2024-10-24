@@ -83,7 +83,7 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
-(defcustom ect/lsp-command-args '("-j=10" "--pch-storage=memory" "--enable-config" "--clang-tidy" "--background-index")
+(defcustom ect/lsp-command-args '("-j=10" "--pch-storage=memory" "--enable-config" "--clang-tidy" "--background-index" "--query-driver=/opt/lt/rel/x86_64-centos7-linux/gcc/14.2.0/bin/g++")
   "lsp command args"
   :type '(repeat strings)
   :group 'emacs-cmake-tools
@@ -180,6 +180,7 @@
     (setq configure_cmd (ect/cmake-generate-configure-command build-directory))
     (ect/cmake-generate-write-query-file cmake-build-directory)
     (setq lt-clangd-compilation-commands-dir (concat "--compile-commands-dir=" cmake-build-directory))
+    (setq lsp-sonarlint-cfamily-compile-commands-path (concat cmake-build-directory "/compile_commands.json"))
     (setq lsp-clients-clangd-args (cons lt-clangd-compilation-commands-dir ect/lsp-command-args))
     (compile configure_cmd)
     (ect/cmake-api-output build-directory)))
