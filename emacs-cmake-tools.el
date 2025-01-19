@@ -83,7 +83,7 @@
   :type 'string
   :group 'emacs-cmake-tools)
 
-(defcustom ect/lsp-command-args '("-j=10" "--pch-storage=memory" "--enable-config" "--clang-tidy" "--background-index" "--query-driver=/opt/lt/rel/x86_64-centos7-linux/gcc/14.2.0/bin/g++")
+(defcustom ect/lsp-command-args '("-j=10" "--pch-storage=memory" "--enable-config" "--clang-tidy" "--background-index")
   "lsp command args"
   :type '(repeat strings)
   :group 'emacs-cmake-tools
@@ -112,6 +112,13 @@
 
 (defvar ect/project-settings (make-hash-table :test 'equal)
   "Local project settings so that it doesnt have to be configured every time.")
+
+(defun ect/remove-tramp-prefix (path)
+  "Remove TRAMP prefix from PATH if it exists."
+  (if (tramp-tramp-file-p path)
+      (tramp-file-name-localname
+       (tramp-dissect-file-name path))
+    path))
 
 (defun ect/cmake-generate-configure-command (build-directory)
   "Helper function for generating the configure command."
@@ -158,7 +165,9 @@
 (defun ect/cmake-generate-write-query-file (build-directory)
   "Helper function which will generate the query file for cmake."
   (setq cmake-query-directory (concat build-directory "/.cmake/api/v1/query/client-emacs-cmake-tools/"))
+  (message "Generating the query in directory : %s and query direcotry : %s" build-directory cmake-query-directory)
   (make-directory cmake-query-directory t)
+  (message "generated directory")
   (setq cmake-query-file (concat cmake-query-directory "/query.json"))
   (setq query '(("requests" . (
                                (
@@ -176,11 +185,15 @@
   (let ((default-directory (projectile-project-root)))
     (setq build-directory-suffix (downcase ect/local-cmake-build-type))
     (setq build-directory (concat ect/cmake-build-directory-prefix "-" build-directory-suffix))
+    (setq project-root (ect/remove-tramp-prefix (projectile-project-root)))
+    (message "project root : %s" project-root)
     (setq cmake-build-directory (concat (projectile-project-root) "/" build-directory))
+    (setq remote-build-directory (concat project-root "/" build-directory))
+    (message "cmake build directory : %s" cmake-build-directory)
     (setq configure_cmd (ect/cmake-generate-configure-command build-directory))
     (ect/cmake-generate-write-query-file cmake-build-directory)
-    (setq lt-clangd-compilation-commands-dir (concat "--compile-commands-dir=" cmake-build-directory))
-    (setq lsp-sonarlint-cfamily-compile-commands-path (concat cmake-build-directory "/compile_commands.json"))
+    (setq lt-clangd-compilation-commands-dir (concat "--compile-commands-dir=" remote-build-directory))
+    (setq lsp-sonarlint-cfamily-compile-commands-path (concat remote-build-directory "/compile_commands.json"))
     (setq lsp-clients-clangd-args (cons lt-clangd-compilation-commands-dir ect/lsp-command-args))
     (compile configure_cmd)
     (ect/cmake-api-output build-directory)))
@@ -305,12 +318,12 @@
 (defun ect/initialize-ect ()
   "Initialize the project level settings."
   (interactive)
-  (let ((file-path (ect/project-settings-file-path)))
-    (unless (file-exists-p file-path)
-      (message "Creating empty file at path %s" file-path)
-      (setq empty-settings (json-encode (make-hash-table :test 'equal)))
-      (write-region empty-settings nil file-path)
-      ))
+  '  (let ((file-path (ect/project-settings-file-path)))
+       (unless (file-exists-p file-path)
+         (message "Creating empty file at path %s" file-path)
+         (setq empty-settings (json-encode (make-hash-table :test 'equal)))
+         (write-region empty-settings nil file-path)
+         ))
 
   (ect/load-project-settings)
   (if (or (eq ect/cmake-source-directory 'unbound) (null ect/cmake-source-directory))
