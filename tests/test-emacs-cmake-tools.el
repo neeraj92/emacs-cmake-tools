@@ -111,4 +111,52 @@
       (should (command-contains-all cmd '("cmake_exec" "-S /src" "-B build-debug" "-DCMAKE_BUILD_TYPE=Debug" "-G Ninja" "-DVAR=ON")))
       (should (command-contains-none cmd '("--preset"))))))
 
+;; Test suite for ect/load-run-configurations and ect/save-run-configurations
+(ert-deftest test-run-config-load-non-existent ()
+  (let* ((temp-dir (make-temp-directory "ect-run-test-"))
+         (_ (make-directory (concat temp-dir "/.git") t))) ; For projectile-project-root
+    (cl-letf (((symbol-function #'projectile-project-root) (lambda () temp-dir)))
+      (should (null (ect/load-run-configurations))))
+    (delete-directory temp-dir t)))
+
+(ert-deftest test-run-config-load-empty-json-array ()
+  (let* ((temp-dir (make-temp-directory "ect-run-test-"))
+         (_ (make-directory (concat temp-dir "/.git") t))
+         (temp-file (concat temp-dir "/" ect/run-config-file-name)))
+    (cl-letf (((symbol-function #'projectile-project-root) (lambda () temp-dir)))
+      (with-temp-file temp-file (insert "[]"))
+      (should (equal (ect/load-run-configurations) '())))
+    (delete-directory temp-dir t)))
+
+(ert-deftest test-run-config-load-malformed-json ()
+  (let* ((temp-dir (make-temp-directory "ect-run-test-"))
+         (_ (make-directory (concat temp-dir "/.git") t))
+         (temp-file (concat temp-dir "/" ect/run-config-file-name)))
+    (cl-letf (((symbol-function #'projectile-project-root) (lambda () temp-dir)))
+      (with-temp-file temp-file (insert "[{\"name\": \"test\"}")) ; Malformed
+      (should (null (ect/load-run-configurations))))
+    (delete-directory temp-dir t)))
+
+(ert-deftest test-run-config-save-and-load-valid ()
+  (let* ((temp-dir (make-temp-directory "ect-run-test-"))
+         (_ (make-directory (concat temp-dir "/.git") t))
+         (sample-configs '(((name . "run1") (binary . "/bin/echo") (args . ("hello")) (cwd . "/tmp") (env . ("ECHO_ENV=true"))))))
+    (cl-letf (((symbol-function #'projectile-project-root) (lambda () temp-dir)))
+      (ect/save-run-configurations sample-configs)
+      (let ((loaded-configs (ect/load-run-configurations)))
+        (should (equal loaded-configs sample-configs))))
+    (delete-directory temp-dir t)))
+
+(ert-deftest test-run-config-save-empty-list ()
+  (let* ((temp-dir (make-temp-directory "ect-run-test-"))
+         (_ (make-directory (concat temp-dir "/.git") t))
+         (temp-file (concat temp-dir "/" ect/run-config-file-name)))
+    (cl-letf (((symbol-function #'projectile-project-root) (lambda () temp-dir)))
+      (ect/save-run-configurations '())
+      (should (equal (ect/load-run-configurations) '()))
+      (with-temp-buffer
+        (insert-file-contents temp-file)
+        (should (string-equal (string-trim (buffer-string)) "[]"))))
+    (delete-directory temp-dir t)))
+
 ;; End of tests

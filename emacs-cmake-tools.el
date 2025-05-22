@@ -1,10 +1,17 @@
 (require 'projectile)
 (require 'json)
 (require 'lsp)
+(require 'cl-lib)
 
 ;;; Commentary:
 ;;; emacs-cmake-tools is a package to provide helper functions to run cmake and ctest commands.
 ;;; Recent additions include support for CMake Presets (CMakePresets.json / CMakeUserPresets.json) via the `ect/cmake-use-presets` toggle.
+;;;
+;;; This package also provides functionality for defining and running custom executable targets.
+;;; Users can create a `.ect.run.json` file in their project root to specify named targets
+;;; with their binaries, arguments, working directories, and environment variables.
+;;; Interactive functions like `ect/add-run-target` (to define new targets) and
+;;; `ect/execute-run-target` (to choose and run a target) are available.
 
 ;;; Code:
 ;;; Path to cmake binary
@@ -133,6 +140,60 @@ preset file is found in the project."
 
 (defconst ect/cmake-preset-file-name "CMakePresets.json"
   "Default name for CMake presets file.")
+
+(defconst ect/run-config-file-name ".ect.run.json"
+  "Default filename for run configurations.")
+
+;;; User-defined Run Targets (.ect.run.json)
+;;
+;; Users can define custom executable targets in a file named .ect.run.json
+;; located in the project root. This file should contain a JSON array
+;; of objects, where each object defines a "run target".
+;;
+;; Each run target object has the following structure:
+;; {
+;;   "name":   "string",  ; A unique name for this run target (e.g., "run-app-debug").
+;;   "binary": "string",  ; Absolute path to the executable.
+;;   "args":   ["string"],; Array of command-line arguments.
+;;   "cwd":    "string",  ; Working directory for execution (e.g., "/path/to/project/build").
+;;                        ; Defaults to project root if not specified or empty during creation.
+;;   "env":    ["string"] ; Array of environment variables in "VAR=VALUE" format.
+;; }
+;;
+;; Example .ect.run.json:
+;; [
+;;   {
+;;     "name": "run-my-server",
+;;     "binary": "/home/user/project/build/server",
+;;     "args": ["--port", "8080", "--verbose"],
+;;     "cwd": "/home/user/project/build",
+;;     "env": ["LD_LIBRARY_PATH=/opt/custom/lib", "DEBUG_MODE=1"]
+;;   }
+;; ]
+
+(defun ect/get-run-config-file-path ()
+  "Return the absolute path to the .ect.run.json file in the current project root."
+  (concat (projectile-project-root) "/" ect/run-config-file-name))
+
+(defun ect/load-run-configurations ()
+  "Load run configurations from .ect.run.json.
+Returns a list of alists, or nil on error/not found."
+  (let ((path (ect/get-run-config-file-path)))
+    (unless (file-exists-p path)
+      (cl-return-from ect/load-run-configurations nil))
+    (condition-case err
+        (with-temp-buffer
+          (insert-file-contents path)
+          (json-parse-buffer :object-type 'alist :array-type 'list :false-value 'json-false))
+      (json-parsing-error
+       (message "Error parsing .ect.run.json: %s" (error-message-string err))
+       nil))))
+
+(defun ect/save-run-configurations (configurations)
+  "Save the list of run CONFIGURATIONS (list of alists) to .ect.run.json."
+  (let ((path-to-save (ect/get-run-config-file-path))
+        (json-pretty-print t)) ; Enable pretty-printing for json-encode
+    (write-region (json-encode configurations) nil path-to-save)))
 
 (defun ect/find-preset-file (project-root)
   "Find the CMake preset file in PROJECT-ROOT.
@@ -466,6 +527,81 @@ Otherwise, it offers a choice from the `ect/cmake-build-types` list."
   (setq ect/project-cmake-build-args args)
   (ect/save-project-settings)
   )
+
+(defun ect/add-run-target ()
+  "Interactively prompts for the details of a new executable run target (name, binary path, arguments, working directory, and environment variables) and adds it to the `.ect.run.json` file in the project root."
+  (interactive)
+  (let* ((target-name (read-string "Run target name: "))
+         (target-binary (read-file-name "Path to executable: " (projectile-project-root) nil t))
+         (target-args
+          (let ((args '()) (arg-input ""))
+            (while (not (string-empty-p (setq arg-input (read-string "Argument (empty to finish): "))))
+              (push arg-input args))
+            (nreverse args)))
+         (target-cwd (read-directory-name "Working directory: " (projectile-project-root)))
+         (target-env
+          (let ((env-vars '()) (env-input ""))
+            (while (not (string-empty-p (setq env-input (read-string "Environment variable (VAR=VAL, empty to finish): "))))
+              (push env-input env-vars))
+            (nreverse env-vars)))
+         (new-target `((name . ,target-name)
+                       (binary . ,target-binary)
+                       (args . ,target-args)
+                       (cwd . ,target-cwd)
+                       (env . ,target-env)))
+         (configurations (or (ect/load-run-configurations) '()))
+         (updated-configurations (cons new-target configurations)))
+    (ect/save-run-configurations updated-configurations)
+    (message "Run target '%s' added to .ect.run.json." target-name)))
+
+(defun ect/choose-run-target ()
+  "Loads run target configurations from `.ect.run.json` in the project root, prompts the user to select one by its name using completing-read, and returns the chosen target's configuration as an alist. Returns nil if no targets are defined or if the user aborts selection."
+  (interactive)
+  (let ((configurations (ect/load-run-configurations)))
+    (if (not configurations)
+        (progn
+          (message "No run targets defined. Use 'ect/add-run-target' to create one.")
+          nil)
+      (let* ((target-names (mapcar (lambda (target) (cdr (assoc 'name target))) configurations))
+             (selected-name (completing-read "Choose run target: " target-names nil t)))
+        (if selected-name
+            (cl-find-if (lambda (target) (string-equal (cdr (assoc 'name target)) selected-name))
+                        configurations)
+          nil)))))
+
+(defun ect/execute-run-target ()
+  "Interactively select a predefined run target and execute it.
+This function first calls `ect/choose-run-target` to allow selection.
+If a target is chosen, its binary is executed with the specified arguments,
+working directory, and environment variables.
+- Output is displayed in the standard *compilation* buffer.
+- Environment variables from the target's configuration are temporarily
+  set for the spawned subprocess and the original Emacs subprocess
+  environment is restored afterwards.
+- The working directory is temporarily changed to the target's 'cwd'
+  for the duration of the command execution."
+  (interactive)
+  (let* ((target (ect/choose-run-target)))
+    (if (not target)
+        (message "No run target selected.")
+      (let* ((target-name (cdr (assoc 'name target)))
+             (target-binary (cdr (assoc 'binary target)))
+             (target-args (cdr (assoc 'args target)))
+             (target-cwd (cdr (assoc 'cwd target)))
+             (target-env (cdr (assoc 'env target)))
+             (original-env (mapcar #'identity (process-environment)))) ; Store original env
+        (let ((default-directory target-cwd)) ; Set working directory
+          ;; Set environment variables (affects Emacs subprocess environment)
+          (dolist (env-var target-env)
+            (let* ((parts (split-string env-var "=")))
+              (when (= (length parts) 2)
+                (setenv (car parts) (cadr parts)))))
+          ;; Construct and run the command
+          (let ((command-string (string-join (cons target-binary target-args) " ")))
+            (message "Executing: %s in %s (Name: %s)" command-string default-directory target-name)
+            (compile command-string))
+          ;; Restore original environment
+          (setq process-environment original-env))))))
 
 
 (provide 'emacs-cmake-tools)
