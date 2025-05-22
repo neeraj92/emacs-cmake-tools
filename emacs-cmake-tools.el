@@ -2,6 +2,10 @@
 (require 'json)
 (require 'lsp)
 
+;;; Commentary:
+;;; emacs-cmake-tools is a package to provide helper functions to run cmake and ctest commands.
+;;; Recent additions include support for CMake Presets (CMakePresets.json / CMakeUserPresets.json) via the `ect/cmake-use-presets` toggle.
+
 ;;; Code:
 ;;; Path to cmake binary
 (defcustom ect/cmake-binary "cmake"
@@ -19,6 +23,15 @@
 (defcustom ect/cmake-build-directory-prefix "build"
   "Prefix to the relative path inside the project directory."
   :type 'string
+  :group 'emacs-cmake-tools)
+
+(defcustom ect/cmake-use-presets nil
+  "Enable CMake preset mode.
+When t, emacs-cmake-tools searches for `CMakePresets.json` or
+`CMakeUserPresets.json` in the project root. Found presets populate
+build configuration choices, overriding `ect/cmake-build-types`.
+The selected preset name is then used with `cmake --preset <name>`."
+  :type 'boolean
   :group 'emacs-cmake-tools)
 
 ;;; Toggle to enable generating compilation database
@@ -47,7 +60,9 @@
 
 ;;; Variable to represent the different build types
 (defcustom ect/cmake-build-types '("Release" "Debug" "RelWithDebInfo" "ReleaseShared" "DebugShared")
-  "List of available build types."
+  "List of available build types.
+Used when `ect/cmake-use-presets` is `nil` or if no valid CMake
+preset file is found in the project."
   :type '(repeat strings)
   :group 'emacs-cmake-tools)
 
@@ -113,6 +128,61 @@
 (defvar ect/project-settings (make-hash-table :test 'equal)
   "Local project settings so that it doesnt have to be configured every time.")
 
+(defconst ect/cmake-user-preset-file-name "CMakeUserPresets.json"
+  "Default name for CMake user presets file.")
+
+(defconst ect/cmake-preset-file-name "CMakePresets.json"
+  "Default name for CMake presets file.")
+
+(defun ect/find-preset-file (project-root)
+  "Find the CMake preset file in PROJECT-ROOT.
+Checks for `CMakeUserPresets.json` first, then `CMakePresets.json`.
+Returns the full path to the file if found, otherwise nil."
+  (let ((user-preset-file (concat project-root "/" ect/cmake-user-preset-file-name))
+        (preset-file (concat project-root "/" ect/cmake-preset-file-name)))
+    (cond
+     ((file-exists-p user-preset-file) user-preset-file)
+     ((file-exists-p preset-file) preset-file)
+     (t nil))))
+
+(defun ect/parse-presets (preset-file-path)
+  "Parse CMake preset file PRESET-FILE-PATH and return a list of preset names.
+Returns nil if the file does not exist, JSON parsing fails, or the
+expected structure is not found."
+  (unless (and preset-file-path (file-exists-p preset-file-path))
+    (message "Preset file does not exist: %s" preset-file-path)
+    (cl-return-from ect/parse-presets nil))
+
+  (let ((json-object nil)
+        (preset-names nil))
+    (with-temp-buffer
+      (insert-file-contents preset-file-path)
+      (condition-case err
+          (setq json-object (json-parse-buffer :object-type 'hash-table))
+        (error
+         (message "Error parsing CMake preset file: %s. Error: %s" preset-file-path err)
+         (cl-return-from ect/parse-presets nil))))
+
+    (unless (hash-table-p json-object)
+      (message "Invalid JSON structure in preset file: %s. Root is not an object." preset-file-path)
+      (cl-return-from ect/parse-presets nil))
+
+    (let ((configure-presets (gethash "configurePresets" json-object)))
+      (unless configure-presets
+        (message "No 'configurePresets' key found in CMake preset file: %s" preset-file-path)
+        (cl-return-from ect/parse-presets nil))
+
+      (unless (vectorp configure-presets)
+        (message "'configurePresets' is not a JSON array in preset file: %s" preset-file-path)
+        (cl-return-from ect/parse-presets nil))
+
+      (dotimes (i (length configure-presets))
+        (let* ((preset (aref configure-presets i))
+               (name (gethash "name" preset)))
+          (when (stringp name)
+            (add-to-list 'preset-names name))))
+      (nreverse preset-names))))
+
 (defun ect/remove-tramp-prefix (path)
   "Remove TRAMP prefix from PATH if it exists."
   (if (tramp-tramp-file-p path)
@@ -121,10 +191,25 @@
     path))
 
 (defun ect/cmake-generate-configure-command (build-directory)
-  "Helper function for generating the configure command."
-
-  (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator " " ect/project-cmake-configure-args))
-  configure_cmd)
+  "Helper function for generating the CMake configure command.
+If `ect/cmake-use-presets` is `t` and `ect/local-cmake-build-type`
+contains a selected preset name, the command will use `cmake --preset <preset-name>`.
+In this mode, `-DCMAKE_BUILD_TYPE` and `-G` are omitted from the command line
+as they are expected to be defined by the preset.
+Otherwise, constructs the command using `ect/local-cmake-build-type` for `-DCMAKE_BUILD_TYPE`
+and `ect/cmake-current-generator` for `-G`."
+  (let ((configure_cmd ""))
+    (if ect/cmake-use-presets
+        (setq configure_cmd (concat ect/cmake-binary " --preset " ect/local-cmake-build-type
+                                    " -S " ect/cmake-source-directory
+                                    " -B " build-directory
+                                    " " ect/project-cmake-configure-args))
+      (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory
+                                    " -B " build-directory
+                                    " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type
+                                    " -G " ect/cmake-current-generator
+                                    " " ect/project-cmake-configure-args)))
+    configure_cmd))
 
 (defun ect/cmake-generate-build-command (build-directory)
   "Helper function to gernrate the build command."
@@ -143,11 +228,28 @@
   path-to-return)
 
 (defun ect/cmake-choose-build-type ()
-  "Helper function to choose the build type."
+  "Helper function to choose the build configuration.
+If `ect/cmake-use-presets` is enabled and a valid CMake preset file
+(CMakePresets.json or CMakeUserPresets.json) is found in the project root,
+this function will offer a choice from the discovered preset names.
+The selected preset name is stored in `ect/local-cmake-build-type`.
+Otherwise, it offers a choice from the `ect/cmake-build-types` list."
   (interactive)
-  (setq ect/local-cmake-build-type (completing-read "Choose build type :" ect/cmake-build-types))
-  (ect/save-project-settings)
-  )
+  (let ((project-root (projectile-project-root)))
+    (if ect/cmake-use-presets
+        (let ((preset-file-path (ect/find-preset-file project-root)))
+          (if preset-file-path
+              (let ((preset-names (ect/parse-presets preset-file-path)))
+                (if (and preset-names (not (eq (length preset-names) 0)))
+                    (setq ect/local-cmake-build-type (completing-read "Choose preset: " preset-names nil t nil))
+                  (progn
+                    (message "No presets found or error parsing preset file. Falling back to default build types.")
+                    (setq ect/local-cmake-build-type (completing-read "Choose build type: " ect/cmake-build-types nil t nil)))))
+            (progn
+              (message "No CMake preset file found in project root. Falling back to default build types.")
+              (setq ect/local-cmake-build-type (completing-read "Choose build type: " ect/cmake-build-types nil t nil)))))
+      (setq ect/local-cmake-build-type (completing-read "Choose build type: " ect/cmake-build-types nil t nil))))
+  (ect/save-project-settings))
 
 (defun ect/cmake-build-target ()
   "Helper function to narrow down the build to a specific target."
