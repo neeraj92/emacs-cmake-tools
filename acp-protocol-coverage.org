@@ -1,46 +1,54 @@
-#+title: ACP Protocol Coverage (cursor-acp.el)
+#+title: ACP Protocol Coverage (cursor-acp)
 #+author: Cursor ACP audit
 #+date: 2026-04-29
 
 * Scope
-This report compares [[https://agentclientprotocol.com/protocol/overview][ACP protocol overview]] against the current implementation in =cursor-acp.el=.
+This report compares [[https://agentclientprotocol.com/protocol/overview][ACP protocol overview]] against the current implementation in the split Cursor ACP modules.
 
-- Implementation analyzed: =cursor-acp.el= only
+- Implementation analyzed: =cursor-acp-core.el=, =cursor-acp-ui.el=, =cursor-acp-transport.el=, =cursor-acp-commands.el= (via =cursor-acp.el= loader)
 - Status labels: =Done=, =Partial=, =Not Implemented=
 
 * Coverage Table
-| Protocol Area | Feature / Method | Status | Current Implementation | Remaining Scope |
-|---+---+---+---+---|
-| Communication Model | JSON-RPC 2.0 request/response + notifications | Done | Outbound requests use =jsonrpc=2.0 with ids; notifications handled in =cursor-acp--handle-message= for =session/update=. | None for baseline transport. |
-| Initialization Phase | =initialize= | Done | Implemented in =cursor-acp--handshake= via =cursor-acp--rpc-call "initialize"=. | Optional: validate negotiated protocol version explicitly. |
-| Initialization Phase | =authenticate= | Done | Implemented in =cursor-acp--handshake= with =authenticate= and =methodId "cursor_login"=. | Optional: support alternate auth methods / auth failure UX. |
-| Session Setup | =session/new= | Done | Implemented in =cursor-acp--handshake=; stores =sessionId= and caches options/capabilities. | Optional: richer session metadata persistence. |
-| Session Setup (optional) | =session/load= | Not Implemented | No =session/load= call path exists. | Add resume command/UI, session picker, and capability check for =loadSession=. |
-| Prompt Turn | =session/prompt= | Done | Implemented in =cursor-acp-send= and command execution path. | Optional: structured prompt content types beyond plain text. |
-| Prompt Turn | =session/update= handling | Partial | Handles =agent_message_chunk= text streaming, mode/model/config/commands cache updates. | Add full update taxonomy handling: thought/user chunks, plan updates, tool state lifecycle, richer rendering by content type. |
-| Prompt Turn | turn end on prompt response (=stopReason=) | Done | Detects =end_turn= in result and finalizes assistant block/spinner. | Add handling for other stop reasons (length/tool/cancel/etc.) and UI messaging. |
-| Prompt Turn | cancellation via =session/cancel= | Not Implemented | =C-c C-k= kills process locally; no protocol-level cancel notification sent. | Implement =session/cancel= notification/request against active turn id/session id; keep hard-kill as fallback. |
-| Agent Optional | =session/set_mode= | Partial | Supports mode switch via =session/set_config_option= when advertised; fallback uses =session/set_mode=. | Normalize to protocol-preferred path per negotiated capabilities; explicit compatibility matrix. |
-| Client Baseline Method | permission request handling (agent->client) | Not Implemented | No handler for permission request methods/callbacks from agent. | Implement permission prompt UX, decision routing (allow/deny), and response RPC wiring. |
-| Client Optional Method | fs.readTextFile | Not Implemented | Client advertises =readTextFile=false=. No method implementation. | Advertise true when implemented; add absolute-path validation, file read RPC handler, error mapping. |
-| Client Optional Method | fs.writeTextFile | Not Implemented | Client advertises =writeTextFile=false=. No method implementation. | Advertise true when implemented; add safe write policy, backup/atomic writes, path checks, error mapping. |
-| Client Optional Method | terminal.create / read / wait / kill / release | Not Implemented | Client advertises =terminal=false=. No terminal RPC handlers. | Implement terminal capability surface and lifecycle API handlers, then advertise capability true. |
-| Notifications/Updates | advertised commands updates | Done | Parses command updates from =session/update= and exposes in UI. | Optional: diff/highlight added/removed commands. |
-| Notifications/Updates | mode change updates | Done | Parses mode change fields in =session/update=. | Optional: explicit mode-change event logging in chat stream. |
-| Notifications/Updates | plans/tool-call updates | Not Implemented | No specific parsing/rendering for plan/tool call event schemas. | Add parsers + transcript visualization for plan steps, tool call progress, permission boundaries. |
-| Argument Requirements | absolute file paths, 1-based lines | Not Applicable / Pending | No file/line RPC methods currently implemented in client. | Enforce when fs/edit methods are added. |
-| Error Handling | JSON-RPC error object handling | Partial | Request path stores =error= and raises Elisp errors; parse failures logged. | Add structured user-facing error states per method/notification class; preserve error codes/messages in UI. |
-| Extensibility | custom methods (= _*=), =_meta= fields | Not Implemented | No explicit custom method registration/handling. | Add generic dispatch for custom methods and pass-through support for =_meta= in requests/responses. |
+| Protocol Area            | Feature / Method                               | Status                   | Current Implementation                                                                                                   | Remaining Scope                                                                                                               |
+|--------------------------+------------------------------------------------+--------------------------+--------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------|
+| Communication Model      | JSON-RPC 2.0 request/response + notifications  | Done                     | Outbound requests use =jsonrpc=2.0 with ids; notifications handled in =cursor-acp--handle-message= for =session/update=. | None for baseline transport.                                                                                                  |
+| Initialization Phase     | =initialize=                                   | Done                     | Implemented in =cursor-acp--handshake= via =cursor-acp--rpc-call "initialize"=.                                          | Optional: validate negotiated protocol version explicitly.                                                                    |
+| Initialization Phase     | =authenticate=                                 | Done                     | Implemented in =cursor-acp--handshake= with =authenticate= and =methodId "cursor_login"=.                                | Optional: support alternate auth methods / auth failure UX.                                                                   |
+| Session Setup            | =session/new=                                  | Done                     | Implemented in =cursor-acp--handshake=; stores =sessionId= and caches options/capabilities.                              | Optional: richer session metadata persistence.                                                                                |
+| Session Setup (optional) | =session/load=                                 | Not Implemented          | No =session/load= call path exists.                                                                                      | Add resume command/UI, session picker, and capability check for =loadSession=.                                                |
+| Prompt Turn              | =session/prompt=                               | Done                     | Implemented in =cursor-acp-send= and command execution path.                                                             | Optional: structured prompt content types beyond plain text.                                                                  |
+| Prompt Turn              | =session/update= handling                      | Partial                  | Handles =agent_message_chunk= text streaming, mode/model/config/commands cache updates.                                  | Add full update taxonomy handling: thought/user chunks, plan updates, tool state lifecycle, richer rendering by content type. |
+| Prompt Turn              | turn end on prompt response (=stopReason=)     | Done                     | Detects terminal stop reasons (including =end_turn= and cancellation variants) and finalizes assistant block/spinner.    | Optional: add explicit UX messaging for non-standard stop reasons (e.g. length/tool limits).                                  |
+| Prompt Turn              | cancellation via =session/cancel=              | Done                     | Implemented via =cursor-acp-cancel-turn= (key: =C-c C-x=), sends protocol cancel notification and keeps process alive.   | Optional: add in-flight turn id tracking if future ACP servers require turn-scoped cancellation payloads.                      |
+| Agent Optional           | =session/set_mode=                             | Partial                  | Supports mode switch via =session/set_config_option= when advertised; fallback uses =session/set_mode=.                  | Normalize to protocol-preferred path per negotiated capabilities; explicit compatibility matrix.                              |
+| Client Baseline Method   | permission request handling (agent->client)    | Done                     | Handles =session/request_permission= with minibuffer choice; logs request/reason and selection in chat; header shows =awaiting-permission=. | Optional: support allow/deny “always” persistence policies; richer details view; queue multiple concurrent requests.          |
+| Client Optional Method   | fs.readTextFile                                | Not Implemented          | Client advertises =readTextFile=false=. No method implementation.                                                        | Advertise true when implemented; add absolute-path validation, file read RPC handler, error mapping.                          |
+| Client Optional Method   | fs.writeTextFile                               | Not Implemented          | Client advertises =writeTextFile=false=. No method implementation.                                                       | Advertise true when implemented; add safe write policy, backup/atomic writes, path checks, error mapping.                     |
+| Client Optional Method   | terminal.create / read / wait / kill / release | Not Implemented          | Client advertises =terminal=false=. No terminal RPC handlers.                                                            | Implement terminal capability surface and lifecycle API handlers, then advertise capability true.                             |
+| Notifications/Updates    | advertised commands updates                    | Done                     | Parses command updates from =session/update= and exposes in UI.                                                          | Optional: diff/highlight added/removed commands.                                                                              |
+| Notifications/Updates    | mode change updates                            | Done                     | Parses mode change fields in =session/update=.                                                                           | Optional: explicit mode-change event logging in chat stream.                                                                  |
+| Notifications/Updates    | plans/tool-call updates                        | Partial                  | Renders =tool_call_update= =rawOutput= into chat as per-key fenced blocks (skips empty values).                          | Add full tool call lifecycle rendering (=tool_call= create events, status transitions, content/diff/terminal payloads, locations). |
+| Argument Requirements    | absolute file paths, 1-based lines             | Not Applicable / Pending | No file/line RPC methods currently implemented in client.                                                                | Enforce when fs/edit methods are added.                                                                                       |
+| Error Handling           | JSON-RPC error object handling                 | Partial                  | Request path stores =error= and raises Elisp errors; parse failures logged.                                              | Add structured user-facing error states per method/notification class; preserve error codes/messages in UI.                   |
+| Extensibility            | custom methods (= _*=), =_meta= fields         | Not Implemented          | No explicit custom method registration/handling.                                                                         | Add generic dispatch for custom methods and pass-through support for =_meta= in requests/responses.                           |
 
 * High-Level Completion
 - Core baseline agent-side flow (initialize/auth/new/prompt/update/end-turn): largely implemented.
-- Biggest missing protocol surface is client capabilities (permissions, file system, terminal) and protocol-level cancel/resume.
-- Practical next milestone: implement =session/cancel= + permission flow first, then file system methods.
+- Biggest missing protocol surface is client capabilities (file system, terminal) and session resume.
+- Practical next milestone: implement file-system methods, then tool-call/plan rendering completeness.
 
 * Suggested Implementation Order
-1. =session/cancel= with in-flight turn tracking.
-2. Permission request/decision method handling and UX.
-3. =session/load= for session resume.
-4. File-system methods (read/write) with strict absolute path checks.
-5. Terminal capability methods.
-6. Rich =session/update= support for tool calls and plans.
+1. =session/load= for session resume.
+2. File-system methods (read/write) with strict absolute path checks.
+3. Terminal capability methods.
+4. Rich =session/update= support for tool calls and plans.
+
+* UI Notes (current state)
+- Chat buffer major mode: =cursor-acp-chat-mode= derived from =markdown-mode= (when installed).
+- Keybindings: ACP keys are provided via an emulation keymap so they continue to work even under markdown.
+- Permission UX:
+  - Requests render in chat with command fenced blocks and a bold Reason section.
+  - Minibuffer prompt waits indefinitely.
+  - If the prompt is cancelled, the request stays pending and can be retried via =C-c C-a= (=cursor-acp-reprompt-permission=).
+- Tool call UX:
+  - When =tool_call_update.rawOutput= is present, it is printed in fenced =text= blocks, split per key (e.g. stdout/stderr).
