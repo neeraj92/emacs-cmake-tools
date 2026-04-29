@@ -1,34 +1,50 @@
 ;;; cursor-acp-commands.el --- Cursor ACP commands -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
 (require 'cursor-acp-core)
 (require 'cursor-acp-ui)
 (require 'cursor-acp-transport)
 
 (defun cursor-acp-focus-input ()
   (interactive)
-  (cursor-acp--input-focus (cursor-acp--ensure-session)))
+  (let* ((buf (current-buffer))
+         (sess (or (cursor-acp--session-for-buffer buf)
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session))))
+    (cursor-acp--input-focus sess)))
 
 (defun cursor-acp-send ()
   (interactive)
-  (let* ((sess (cursor-acp--ensure-session))
-         (text (cursor-acp--input-text sess)))
+  (let* ((buf (current-buffer))
+         (sess (or (cursor-acp--session-for-buffer buf)
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session)))
+         (text (if (eq buf (cursor-acp--session-input-buffer sess))
+                   (string-trim-right (buffer-substring-no-properties (point-min) (point-max)))
+                 (cursor-acp--input-text sess))))
     (when (string-empty-p (string-trim text))
       (user-error "Input is empty"))
-    (cursor-acp--input-clear sess)
+    (if (eq buf (cursor-acp--session-input-buffer sess))
+        (let ((inhibit-read-only t)) (erase-buffer))
+      (cursor-acp--input-clear sess))
     (cursor-acp--chat-append-user sess text)
     (cursor-acp--chat-open-assistant sess)
     (cursor-acp--set-busy sess t)
     (let ((sid (cursor-acp--ensure-connected-session sess)))
-      (cursor-acp--rpc-send
+      (cursor-acp--set-active-session-id sid)
+      (cursor-acp--rpc-send-async
        sess "session/prompt"
        `((sessionId . ,sid)
-         (prompt . [((type . "text") (text . ,text))]))))
+         (prompt . [((type . "text") (text . ,text))]))
+       sid))
     (cursor-acp--input-focus sess)))
 
 (defun cursor-acp-cancel-turn ()
   "Request cancellation of the current ACP turn."
   (interactive)
-  (let* ((sess (cursor-acp--ensure-session))
+  (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session)))
          (sid (cursor-acp--ensure-connected-session sess)))
     (unless (cursor-acp--session-busy sess)
       (user-error "No active turn to cancel"))
@@ -40,7 +56,10 @@
 (defun cursor-acp-reprompt-permission ()
   "Re-open prompt for a pending permission request."
   (interactive)
-  (cursor-acp--reprompt-pending-permission (cursor-acp--ensure-session)))
+  (cursor-acp--reprompt-pending-permission
+   (or (cursor-acp--session-for-buffer (current-buffer))
+       (cursor-acp--active-session)
+       (cursor-acp--ensure-session))))
 
 (defun cursor-acp-start ()
   "Start ACP and create a session."
@@ -50,9 +69,10 @@
     (condition-case err
         (progn
           (cursor-acp--handshake sess)
-          (with-current-buffer (cursor-acp--session-chat-buffer sess)
-            (setq-local header-line-format (cursor-acp--status-line sess)))
-          (cursor-acp--render-info sess))
+          (let ((s (or (cursor-acp--active-session) sess)))
+            (with-current-buffer (cursor-acp--session-chat-buffer s)
+              (setq-local header-line-format (cursor-acp--status-line s)))
+            (cursor-acp--render-info s)))
       (error
        (cursor-acp--log sess "error" (format "%S" err))
        (with-current-buffer (cursor-acp--session-chat-buffer sess)
@@ -65,10 +85,9 @@
   (interactive)
   (let ((sess (cursor-acp--ensure-session)))
     (cursor-acp--set-busy sess nil)
-    (when-let ((proc (cursor-acp--session-process sess)))
+    (when-let ((proc (cursor-acp--conn-process (cursor-acp--ensure-conn))))
       (ignore-errors (delete-process proc)))
-    (setf (cursor-acp--session-process sess) nil)
-    (setf (cursor-acp--session-session-id sess) nil)
+    (setf (cursor-acp--conn-process (cursor-acp--ensure-conn)) nil)
     (cursor-acp--log sess "process" "killed by user")
     (with-current-buffer (cursor-acp--session-chat-buffer sess)
       (setq-local header-line-format (cursor-acp--status-line sess)))
@@ -158,6 +177,62 @@
        (prompt . [((type . "text")
                    (text . ,(string-trim (format "/%s %s" cmd-name (or arg "")))))])))))
 
+(defun cursor-acp-switch-session ()
+  "List sessions and switch to one (load/resume), then reset layout."
+  (interactive)
+  (let ((bootstrap (cursor-acp--ensure-session)))
+    (cursor-acp--ensure-process bootstrap)
+    (when (or (not (process-live-p (cursor-acp--conn-process (cursor-acp--ensure-conn))))
+              (not (cursor-acp--conn-init-result (cursor-acp--ensure-conn))))
+      (cursor-acp-start))
+    (let* ((sess (cursor-acp--ensure-session))
+           (items
+            (if (cursor-acp--cap-session-list-p)
+                (let* ((res (cursor-acp--rpc-session-list sess))
+                       (sessions (and (hash-table-p res) (cursor-acp--ht-get res "sessions"))))
+                  (cl-remove-if-not #'hash-table-p (cursor-acp--normalize-items sessions)))
+              (let (acc)
+                (when (hash-table-p cursor-acp--sessions)
+                  (maphash
+                   (lambda (k v)
+                     (ignore k)
+                     (when (and (cursor-acp--valid-session-p v)
+                                (stringp (cursor-acp--session-session-id v)))
+                       (let ((ht (make-hash-table :test 'equal)))
+                         (puthash "sessionId" (cursor-acp--session-session-id v) ht)
+                         (puthash "title" (cursor-acp--session-title v) ht)
+                         (push ht acc))))
+                   cursor-acp--sessions))
+                (nreverse acc))))
+           (alist
+            (mapcar
+             (lambda (it)
+               (let* ((sid (cursor-acp--ht-get it "sessionId"))
+                      (title (or (cursor-acp--ht-get it "title") "Untitled"))
+                      (cwd (cursor-acp--ht-get it "cwd"))
+                      (updated (or (cursor-acp--ht-get it "updatedAt") "")))
+                 (cons (format "%s%s"
+                               title
+                               (if (string-empty-p (string-trim updated)) "" (format "  (%s)" updated)))
+                       (list sid title cwd))))
+             items))
+           (choice (completing-read "Session: " (mapcar #'car alist) nil t))
+           (sel (cdr (assoc choice alist)))
+           (sid (nth 0 sel))
+           (title (nth 1 sel))
+           (cwd (nth 2 sel)))
+      (unless (stringp sid)
+        (user-error "No session selected"))
+      (let ((target (cursor-acp--ensure-session-by-id sid title cwd)))
+        (cursor-acp--set-active-session-id sid)
+        (cursor-acp--ensure-session-buffers target)
+        (cursor-acp-reset-layout)
+        (cursor-acp--chat-clear target)
+        (if (cursor-acp--cap-load-session-p)
+            (cursor-acp--rpc-session-load target sid)
+          (when (cursor-acp--cap-session-resume-p)
+            (cursor-acp--rpc-session-resume target sid)))))))
+
 (defun cursor-acp-reset-layout ()
   "Reset ACP windows in current frame to the default layout."
   (interactive)
@@ -199,7 +274,9 @@
 (defun cursor-acp ()
   "Open the Cursor ACP buffer."
   (interactive)
-  (cursor-acp--open-ui (cursor-acp--ensure-session)))
+  (let ((sess (cursor-acp--ensure-session)))
+    (cursor-acp--ensure-connected-session sess)
+    (cursor-acp--open-ui (or (cursor-acp--active-session) sess))))
 
 (provide 'cursor-acp-commands)
 ;;; cursor-acp-commands.el ends here

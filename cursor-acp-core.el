@@ -50,12 +50,17 @@
   "Face for agent response text in chat buffer."
   :group 'cursor-acp)
 
-(cl-defstruct (cursor-acp--session (:constructor cursor-acp--make-session))
+(cl-defstruct (cursor-acp--conn (:constructor cursor-acp--make-conn))
   process
   stdout-acc
   pending
   next-id
+  init-result)
+
+(cl-defstruct (cursor-acp--session (:constructor cursor-acp--make-session))
   session-id
+  title
+  cwd
   current-mode
   current-model
   config-options
@@ -77,10 +82,11 @@
   info-buffer
   log-buffer)
 
-(defvar cursor-acp--current-session nil)
+(defvar cursor-acp--conn nil)
+(defvar cursor-acp--sessions nil
+  "Hash table mapping sessionId -> `cursor-acp--session'.")
+(defvar cursor-acp--active-session-id nil)
 
-(defconst cursor-acp--chat-buffer-name "*cursor-acp*")
-(defconst cursor-acp--input-buffer-name "*cursor-acp-input*")
 (defconst cursor-acp--info-buffer-name "*cursor-acp-info*")
 (defconst cursor-acp--log-buffer-name "*cursor-acp-log*")
 
@@ -104,59 +110,60 @@ This uses `markdown-mode' markup-hiding overlays when available."
   :type 'boolean
   :group 'cursor-acp)
 
-(defun cursor-acp--ensure-buffer (name)
-  (get-buffer-create name))
+(defun cursor-acp--ensure-sessions-table ()
+  (unless (hash-table-p cursor-acp--sessions)
+    (setq cursor-acp--sessions (make-hash-table :test #'equal)))
+  cursor-acp--sessions)
 
-(defun cursor-acp--count-words (s)
-  (length (split-string (or s "") "[ \t\n\r]+" t)))
+(defun cursor-acp--ensure-conn ()
+  (let ((c cursor-acp--conn))
+    (unless (and c (ignore-errors (cursor-acp--conn-next-id c)))
+      (setq c (cursor-acp--make-conn
+               :process nil
+               :stdout-acc ""
+               :pending (make-hash-table :test #'eql)
+               :next-id 1
+               :init-result nil))
+      (setq cursor-acp--conn c))
+    c))
 
-(defun cursor-acp-reset ()
-  "Reset the in-memory session state and kill the ACP process if running."
-  (interactive)
-  (when-let ((sess cursor-acp--current-session))
-    (when-let ((tmr (ignore-errors (cursor-acp--session-spinner-timer sess))))
-      (ignore-errors (cancel-timer tmr)))
-    (when-let ((proc (ignore-errors (cursor-acp--session-process sess))))
-      (when (process-live-p proc)
-        (ignore-errors (delete-process proc))))
-    (dolist (buf (list (ignore-errors (cursor-acp--session-chat-buffer sess))
-                       (ignore-errors (cursor-acp--session-input-buffer sess))
-                       (ignore-errors (cursor-acp--session-info-buffer sess))
-                       (ignore-errors (cursor-acp--session-log-buffer sess))))
-      (when (buffer-live-p buf)
-        (ignore-errors (kill-buffer buf)))))
-  (setq cursor-acp--current-session nil)
-  (message "cursor-acp session reset"))
+(defun cursor-acp--session-buffer-title (sess)
+  (let ((t0 (string-trim (or (cursor-acp--session-title sess) ""))))
+    (if (string-empty-p t0) "Untitled" t0)))
 
-(defun cursor-acp--valid-session-p (sess)
-  (and sess
-       (condition-case nil
-           (progn
-             (cursor-acp--session-current-mode sess)
-             (cursor-acp--session-available-commands sess)
-             (cursor-acp--session-ui-expanded sess)
-             (cursor-acp--session-chat-buffer sess)
-             (cursor-acp--session-log-buffer sess)
-             t)
-         (error nil))))
+(defun cursor-acp--chat-buffer-name (sess)
+  (format "*cursor-acp: %s*" (cursor-acp--session-buffer-title sess)))
 
-(defun cursor-acp--ui-set-expanded (sess section expanded)
-  (let ((h (cursor-acp--session-ui-expanded sess)))
-    (when (hash-table-p h)
-      (puthash section expanded h))))
+(defun cursor-acp--input-buffer-name (sess)
+  (format "*cursor-acp-input: %s*" (cursor-acp--session-buffer-title sess)))
 
-(defun cursor-acp--ensure-session ()
-  (let ((sess cursor-acp--current-session))
+(defun cursor-acp--rename-session-buffers (sess)
+  (when (cursor-acp--valid-session-p sess)
+    (when-let ((chat (cursor-acp--session-chat-buffer sess)))
+      (when (buffer-live-p chat)
+        (with-current-buffer chat
+          (rename-buffer (generate-new-buffer-name (cursor-acp--chat-buffer-name sess)) t))))
+    (when-let ((input (cursor-acp--session-input-buffer sess)))
+      (when (buffer-live-p input)
+        (with-current-buffer input
+          (rename-buffer (generate-new-buffer-name (cursor-acp--input-buffer-name sess)) t))))))
+
+(defun cursor-acp--session-by-id (session-id)
+  (when (and (stringp session-id) (not (string-empty-p session-id)))
+    (gethash session-id (cursor-acp--ensure-sessions-table) nil)))
+
+(defun cursor-acp--ensure-session-by-id (session-id &optional title cwd)
+  (unless (and (stringp session-id) (not (string-empty-p session-id)))
+    (error "Missing sessionId"))
+  (let* ((tab (cursor-acp--ensure-sessions-table))
+         (sess (gethash session-id tab nil)))
     (unless (cursor-acp--valid-session-p sess)
-      (setq sess nil)
-      (setq cursor-acp--current-session nil))
+      (setq sess nil))
     (unless sess
       (setq sess (cursor-acp--make-session
-                  :process nil
-                  :stdout-acc ""
-                  :pending (make-hash-table :test #'eql)
-                  :next-id 1
-                  :session-id nil
+                  :session-id session-id
+                  :title (or title "Untitled")
+                  :cwd (and (stringp cwd) (not (string-empty-p (string-trim cwd))) (expand-file-name cwd))
                   :current-mode "agent"
                   :current-model nil
                   :config-options nil
@@ -181,27 +188,156 @@ This uses `markdown-mode' markup-hiding overlays when available."
       (cursor-acp--ui-set-expanded sess "Modes" t)
       (cursor-acp--ui-set-expanded sess "Models" t)
       (cursor-acp--ui-set-expanded sess "Commands" t)
-      (setq cursor-acp--current-session sess))
-    (let ((chat (cursor-acp--session-chat-buffer sess))
-          (input (cursor-acp--session-input-buffer sess))
-          (info (cursor-acp--session-info-buffer sess))
-          (log (cursor-acp--session-log-buffer sess)))
-      (unless (buffer-live-p chat)
-        (setf (cursor-acp--session-chat-buffer sess)
-              (cursor-acp--ensure-buffer cursor-acp--chat-buffer-name)))
-      (unless (buffer-live-p input)
-        (setf (cursor-acp--session-input-buffer sess)
-              (cursor-acp--ensure-buffer cursor-acp--input-buffer-name)))
-      (unless (buffer-live-p info)
-        (setf (cursor-acp--session-info-buffer sess)
-              (cursor-acp--ensure-buffer cursor-acp--info-buffer-name)))
-      (unless (buffer-live-p log)
-        (setf (cursor-acp--session-log-buffer sess)
-              (cursor-acp--ensure-buffer cursor-acp--log-buffer-name)))
-      (with-current-buffer (cursor-acp--session-log-buffer sess)
-        (setq-local truncate-lines nil)
-        (setq-local word-wrap t)))
+      (puthash session-id sess tab))
+    (when (and (stringp title) (not (string-empty-p (string-trim title))))
+      (setf (cursor-acp--session-title sess) title))
+    (when (and (stringp cwd) (not (string-empty-p (string-trim cwd))))
+      (setf (cursor-acp--session-cwd sess) (expand-file-name cwd)))
+    (cursor-acp--ensure-session-buffers sess)
+    (cursor-acp--rename-session-buffers sess)
     sess))
+
+(defun cursor-acp--set-active-session-id (session-id)
+  (setq cursor-acp--active-session-id session-id))
+
+(defun cursor-acp--active-session ()
+  (cursor-acp--session-by-id cursor-acp--active-session-id))
+
+(defun cursor-acp--session-for-buffer (buf)
+  "Return the session that owns BUF (chat/input/info/log), else nil."
+  (when (and (buffer-live-p buf) (hash-table-p cursor-acp--sessions))
+    (catch 'found
+      (maphash
+       (lambda (_k sess)
+         (when (and (cursor-acp--valid-session-p sess)
+                    (memq buf (list (cursor-acp--session-chat-buffer sess)
+                                    (cursor-acp--session-input-buffer sess)
+                                    (cursor-acp--session-info-buffer sess)
+                                    (cursor-acp--session-log-buffer sess))))
+           (throw 'found sess)))
+       cursor-acp--sessions)
+      nil)))
+
+(defun cursor-acp--ensure-buffer (name)
+  (get-buffer-create name))
+
+(defun cursor-acp--ensure-unique-buffer (name)
+  (get-buffer-create (generate-new-buffer-name name)))
+
+(defun cursor-acp--count-words (s)
+  (length (split-string (or s "") "[ \t\n\r]+" t)))
+
+(defun cursor-acp-reset ()
+  "Reset all in-memory session state and kill the ACP process if running."
+  (interactive)
+  (when-let ((conn cursor-acp--conn))
+    (when-let ((proc (ignore-errors (cursor-acp--conn-process conn))))
+      (when (process-live-p proc)
+        (ignore-errors (delete-process proc)))))
+  (when (hash-table-p cursor-acp--sessions)
+    (maphash
+     (lambda (_sid sess)
+       (when-let ((tmr (ignore-errors (cursor-acp--session-spinner-timer sess))))
+         (ignore-errors (cancel-timer tmr)))
+       (dolist (buf (list (ignore-errors (cursor-acp--session-chat-buffer sess))
+                          (ignore-errors (cursor-acp--session-input-buffer sess))
+                          (ignore-errors (cursor-acp--session-info-buffer sess))
+                          (ignore-errors (cursor-acp--session-log-buffer sess))))
+         (when (buffer-live-p buf)
+           (ignore-errors (kill-buffer buf)))))
+     cursor-acp--sessions))
+  (setq cursor-acp--conn nil)
+  (setq cursor-acp--sessions nil)
+  (setq cursor-acp--active-session-id nil)
+  (message "cursor-acp session reset"))
+
+(defun cursor-acp--valid-session-p (sess)
+  (and sess
+       (condition-case nil
+           (progn
+             (cursor-acp--session-current-mode sess)
+             (cursor-acp--session-available-commands sess)
+             (cursor-acp--session-ui-expanded sess)
+             (cursor-acp--session-chat-buffer sess)
+             (cursor-acp--session-log-buffer sess)
+             t)
+         (error nil))))
+
+(defun cursor-acp--ui-set-expanded (sess section expanded)
+  (let ((h (cursor-acp--session-ui-expanded sess)))
+    (when (hash-table-p h)
+      (puthash section expanded h))))
+
+(defun cursor-acp--ensure-session-buffers (sess)
+  (let ((chat (cursor-acp--session-chat-buffer sess))
+        (input (cursor-acp--session-input-buffer sess))
+        (info (cursor-acp--session-info-buffer sess))
+        (log (cursor-acp--session-log-buffer sess)))
+    (unless (buffer-live-p chat)
+      (setf (cursor-acp--session-chat-buffer sess)
+            (cursor-acp--ensure-unique-buffer (cursor-acp--chat-buffer-name sess))))
+    (unless (buffer-live-p input)
+      (setf (cursor-acp--session-input-buffer sess)
+            (cursor-acp--ensure-unique-buffer (cursor-acp--input-buffer-name sess))))
+    (unless (buffer-live-p info)
+      (setf (cursor-acp--session-info-buffer sess)
+            (cursor-acp--ensure-buffer cursor-acp--info-buffer-name)))
+    (unless (buffer-live-p log)
+      (setf (cursor-acp--session-log-buffer sess)
+            (cursor-acp--ensure-buffer cursor-acp--log-buffer-name)))
+    (with-current-buffer (cursor-acp--session-log-buffer sess)
+      (setq-local truncate-lines nil)
+      (setq-local word-wrap t)))
+  sess)
+
+(defun cursor-acp--ensure-session ()
+  "Return the active session, creating a bootstrap session if needed."
+  (cursor-acp--ensure-conn)
+  (cursor-acp--ensure-sessions-table)
+  (let* ((sid cursor-acp--active-session-id)
+         (sess (and (stringp sid) (cursor-acp--session-by-id sid))))
+    (unless (cursor-acp--valid-session-p sess)
+      (setq sess nil))
+    (unless sess
+      (setq sid "__bootstrap__")
+      (setq sess (cursor-acp--make-session
+                  :session-id nil
+                  :title "New Session"
+                  :cwd nil
+                  :current-mode "agent"
+                  :current-model nil
+                  :config-options nil
+                  :available-modes nil
+                  :available-models nil
+                  :available-commands nil
+                  :ui-expanded (make-hash-table :test #'equal)
+                  :busy nil
+                  :spinner-idx 0
+                  :spinner-timer nil
+                  :awaiting-permission nil
+                  :permission-request-id nil
+                  :permission-request-params nil
+                  :assistant-frag ""
+                  :draft-input ""
+                  :main-buffer nil
+                  :chat-buffer nil
+                  :input-buffer nil
+                  :info-buffer nil
+                  :log-buffer nil))
+      (cursor-acp--ui-set-expanded sess "Keys" t)
+      (cursor-acp--ui-set-expanded sess "Modes" t)
+      (cursor-acp--ui-set-expanded sess "Models" t)
+      (cursor-acp--ui-set-expanded sess "Commands" t)
+      (puthash sid sess cursor-acp--sessions)
+      (setq cursor-acp--active-session-id sid))
+    (cursor-acp--ensure-session-buffers sess)
+    sess))
+
+(defun cursor-acp--workspace-root (sess)
+  "Return workspace root directory for SESS (the session's stored cwd)."
+  (let ((cwd (and (cursor-acp--valid-session-p sess)
+                  (cursor-acp--session-cwd sess))))
+    (file-name-as-directory (expand-file-name (or cwd default-directory)))))
 
 (defun cursor-acp--json-encode (obj)
   (json-serialize obj :null-object :null :false-object :json-false))
@@ -225,7 +361,8 @@ This uses `markdown-mode' markup-hiding overlays when available."
         (insert "\n\n")))))
 
 (defun cursor-acp--status-line (sess)
-  (let* ((proc (cursor-acp--session-process sess))
+  (let* ((conn (cursor-acp--ensure-conn))
+         (proc (cursor-acp--conn-process conn))
          (alive (and proc (process-live-p proc)))
          (sid (cursor-acp--session-session-id sess))
          (mode (or (cursor-acp--session-current-mode sess) "-"))
@@ -244,6 +381,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
      (when sp (format " %s" sp))
      (when awaiting " awaiting-permission")
      (when sid (format "  sessionId=%s" sid))
+     (format "  title=%s" (cursor-acp--session-buffer-title sess))
      (format "  mode=%s  model=%s" mode model))))
 
 (defun cursor-acp--refresh-header (sess)
@@ -258,14 +396,14 @@ This uses `markdown-mode' markup-hiding overlays when available."
     (ignore-errors (cancel-timer tmr)))
   (setf (cursor-acp--session-spinner-idx sess) 0)
   (setf (cursor-acp--session-spinner-timer sess)
-        (run-at-time 0 cursor-acp--spinner-interval
-                     (lambda ()
-                       (when (cursor-acp--valid-session-p cursor-acp--current-session)
-                         (let ((s cursor-acp--current-session))
-                           (when (cursor-acp--session-busy s)
-                             (setf (cursor-acp--session-spinner-idx s)
-                                   (1+ (or (cursor-acp--session-spinner-idx s) 0)))
-                             (cursor-acp--refresh-header s))))))))
+        (run-at-time
+         0 cursor-acp--spinner-interval
+         (lambda ()
+           (when-let ((s (cursor-acp--active-session)))
+             (when (cursor-acp--session-busy s)
+               (setf (cursor-acp--session-spinner-idx s)
+                     (1+ (or (cursor-acp--session-spinner-idx s) 0)))
+               (cursor-acp--refresh-header s)))))))
 
 (defun cursor-acp--spinner-stop (sess)
   (when-let ((tmr (cursor-acp--session-spinner-timer sess)))

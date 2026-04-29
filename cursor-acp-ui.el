@@ -65,6 +65,7 @@
    "C-c C-x  cancel turn"
    "C-c C-a  reprompt permission"
    "C-c C-r  reset layout"
+   "C-c C-w  switch session"
    "C-c C-l  show logs"
    "C-c C-i  show info"
    "C-c C-p  focus input"
@@ -106,6 +107,14 @@
 (defun cursor-acp--chat-eob-p ()
   (>= (point) (max (point-min) (- (point-max) 2))))
 
+(defun cursor-acp--chat-scroll-to-end (buf)
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (goto-char (point-max))
+      (dolist (win (get-buffer-window-list buf nil t))
+        (when (window-live-p win)
+          (set-window-point win (point-max)))))))
+
 (defun cursor-acp--chat-insert (sess s &optional read-only face)
   (let ((buf (cursor-acp--session-chat-buffer sess)))
     (with-current-buffer buf
@@ -120,8 +129,14 @@
     (with-current-buffer buf
       (when (and (bound-and-true-p font-lock-mode) (fboundp 'font-lock-ensure))
         (font-lock-ensure (max (point-min) (- (point-max) (length s))) (point-max))))
-    (with-current-buffer buf
-      (goto-char (point-max)))))
+    (cursor-acp--chat-scroll-to-end buf)))
+
+(defun cursor-acp--chat-clear (sess)
+  (with-current-buffer (cursor-acp--session-chat-buffer sess)
+    (let ((inhibit-read-only t))
+      (erase-buffer))
+    (setq-local cursor-acp--assistant-open nil)
+    (setq-local cursor-acp--assistant-start nil)))
 
 (defun cursor-acp--chat-insert-prefix (sess face)
   (let ((buf (cursor-acp--session-chat-buffer sess)))
@@ -145,12 +160,12 @@
     (cursor-acp--chat-insert sess "\n" t)))
 
 (defun cursor-acp--chat-open-assistant (sess)
-  (unless cursor-acp--assistant-open
-    (setq-local cursor-acp--assistant-open t)
-    (with-current-buffer (cursor-acp--session-chat-buffer sess)
-      (setq-local cursor-acp--assistant-start (copy-marker (point-max) nil)))
-    (cursor-acp--chat-insert sess "\n" t)
-    (cursor-acp--chat-insert-prefix sess 'cursor-acp-agent-prefix-face)))
+  (with-current-buffer (cursor-acp--session-chat-buffer sess)
+    (unless cursor-acp--assistant-open
+      (setq-local cursor-acp--assistant-open t)
+      (setq-local cursor-acp--assistant-start (copy-marker (point-max) nil))
+      (cursor-acp--chat-insert sess "\n" t)
+      (cursor-acp--chat-insert-prefix sess 'cursor-acp-agent-prefix-face))))
 
 (defun cursor-acp--hide-markup-region (beg end)
   (when (and (integerp beg) (integerp end) (< beg end))
@@ -242,7 +257,8 @@
   (with-current-buffer (cursor-acp--session-chat-buffer sess)
     (when (markerp cursor-acp--assistant-start)
       (cursor-acp--hide-markup-region (marker-position cursor-acp--assistant-start) (point-max))))
-  (setq-local cursor-acp--assistant-open nil)
+  (with-current-buffer (cursor-acp--session-chat-buffer sess)
+    (setq-local cursor-acp--assistant-open nil))
   (cursor-acp--chat-insert sess "\n\n" t))
 
 (defun cursor-acp--permission-request-summary (params)
@@ -382,6 +398,7 @@
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
     (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
+    (define-key map (kbd "C-c C-w") #'cursor-acp-switch-session)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
     (define-key map (kbd "C-c C-i") #'cursor-acp-show-info)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
@@ -421,7 +438,9 @@
   "Major mode for Cursor ACP input buffer."
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
-  (cursor-acp--enable-emulation-keys))
+  (cursor-acp--enable-emulation-keys)
+  (add-hook 'completion-at-point-functions #'cursor-acp--at-file-capf nil t)
+  (add-hook 'post-self-insert-hook #'cursor-acp--maybe-trigger-at-file-completion nil t))
 
 (defvar cursor-acp-input-mode-map
   (let ((map (copy-keymap text-mode-map)))
@@ -476,6 +495,53 @@
     (evil-define-key '(insert) cursor-acp-chat-mode-map
       (kbd "C-c C-i") #'cursor-acp-show-info
       (kbd "C-c C-p") #'cursor-acp-focus-input)))
+
+(defvar cursor-acp--at-file-cache (make-hash-table :test #'equal))
+
+(defun cursor-acp--path-has-hidden-component-p (path)
+  (let* ((parts (split-string (directory-file-name path) "/" t)))
+    (catch 'hidden
+      (dolist (p parts)
+        (when (and (stringp p) (not (string-empty-p p))
+                   (eq (aref p 0) ?.))
+          (throw 'hidden t)))
+      nil)))
+
+(defun cursor-acp--workspace-files (root)
+  (let* ((r (file-name-as-directory (expand-file-name root)))
+         (cached (gethash r cursor-acp--at-file-cache)))
+    (or cached
+        (let* ((all (ignore-errors (directory-files-recursively r ".*" nil nil)))
+               (files
+                (cl-remove-if
+                 (lambda (p)
+                   (or (not (stringp p))
+                       (cursor-acp--path-has-hidden-component-p (file-relative-name p r))))
+                 all))
+               (rel (sort (mapcar (lambda (p) (file-relative-name p r)) files) #'string-lessp)))
+          (puthash r rel cursor-acp--at-file-cache)
+          rel))))
+
+(defun cursor-acp--at-file-capf ()
+  "Completion for workspace files after '@' in ACP input buffers."
+  (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session)))
+         (end (point)))
+    (save-excursion
+      (skip-chars-backward "A-Za-z0-9_./-")
+      (let* ((beg (point))
+             (at-pos (1- beg)))
+        (when (and (>= at-pos (point-min))
+                   (eq (char-after at-pos) ?@))
+          (list beg end
+                (cursor-acp--workspace-files (cursor-acp--workspace-root sess))
+                :exclusive 'no))))))
+
+(defun cursor-acp--maybe-trigger-at-file-completion ()
+  (when (and (eq major-mode 'cursor-acp-input-mode)
+             (eq last-command-event ?@))
+    (completion-at-point)))
 
 (defun cursor-acp--acp-buffer-p (sess buf)
   (and (buffer-live-p buf)

@@ -15,7 +15,10 @@ This report compares [[https://agentclientprotocol.com/protocol/overview][ACP pr
 | Initialization Phase     | =initialize=                                   | Done                     | Implemented in =cursor-acp--handshake= via =cursor-acp--rpc-call "initialize"=.                                          | Optional: validate negotiated protocol version explicitly.                                                                    |
 | Initialization Phase     | =authenticate=                                 | Done                     | Implemented in =cursor-acp--handshake= with =authenticate= and =methodId "cursor_login"=.                                | Optional: support alternate auth methods / auth failure UX.                                                                   |
 | Session Setup            | =session/new=                                  | Done                     | Implemented in =cursor-acp--handshake=; stores =sessionId= and caches options/capabilities.                              | Optional: richer session metadata persistence.                                                                                |
-| Session Setup (optional) | =session/load=                                 | Not Implemented          | No =session/load= call path exists.                                                                                      | Add resume command/UI, session picker, and capability check for =loadSession=.                                                |
+| Session Setup (optional) | =session/list=                                 | Done                     | Implemented in =cursor-acp-switch-session= via =cursor-acp--rpc-session-list= (capability gated).                        | Add pager support (=nextCursor=), and better UI for large lists (search/filter/sort).                                          |
+| Session Setup (optional) | =session/load=                                 | Partial                  | Implemented in =cursor-acp-switch-session= via =cursor-acp--rpc-session-load= (capability gated).                        | History replay not fully rendered yet: handle replay update types (e.g. =user_message_chunk=) and any assistant replay variants. |
+| Session Setup (optional) | =session/resume=                               | Done                     | Implemented in =cursor-acp-switch-session= via =cursor-acp--rpc-session-resume= (capability gated).                      | If agent omits resume capability, continue falling back to =session/load=.                                                     |
+| Session Setup (optional) | =session/close=                                | Not Implemented          | No =session/close= call path exists.                                                                                     | Requires =initialize.agentCapabilities.sessionCapabilities.close=. Use to free agent-side resources for inactive sessions.    |
 | Prompt Turn              | =session/prompt=                               | Done                     | Implemented in =cursor-acp-send= and command execution path.                                                             | Optional: structured prompt content types beyond plain text.                                                                  |
 | Prompt Turn              | =session/update= handling                      | Partial                  | Handles =agent_message_chunk= text streaming, mode/model/config/commands cache updates.                                  | Add full update taxonomy handling: thought/user chunks, plan updates, tool state lifecycle, richer rendering by content type. |
 | Prompt Turn              | turn end on prompt response (=stopReason=)     | Done                     | Detects terminal stop reasons (including =end_turn= and cancellation variants) and finalizes assistant block/spinner.    | Optional: add explicit UX messaging for non-standard stop reasons (e.g. length/tool limits).                                  |
@@ -34,14 +37,16 @@ This report compares [[https://agentclientprotocol.com/protocol/overview][ACP pr
 
 * High-Level Completion
 - Core baseline agent-side flow (initialize/auth/new/prompt/update/end-turn): largely implemented.
-- Biggest missing protocol surface is client capabilities (file system, terminal) and session resume.
-- Practical next milestone: implement file-system methods, then tool-call/plan rendering completeness.
+- Biggest missing protocol surface is transcript replay completeness for multi-session (=session/load=), plus client capabilities (file system, terminal).
+- Practical next milestone: finish =session/load= history rendering (replay update taxonomy), then move to fs/terminal and fuller tool-call rendering.
 
 * Suggested Implementation Order
-1. =session/load= for session resume.
-2. File-system methods (read/write) with strict absolute path checks.
-3. Terminal capability methods.
-4. Rich =session/update= support for tool calls and plans.
+1. Finish =session/load= transcript replay: implement rendering for replay update types (at minimum =user_message_chunk=, plus any assistant chunk variants the agent emits during replay).
+2. Improve session picker UX: paging for =session/list= (=nextCursor=), and display more metadata (cwd, updatedAt, tags).
+3. Optional: add =session/close= if agent supports it (and a cleanup command).
+4. File-system methods (read/write) with strict absolute path checks.
+5. Terminal capability methods.
+6. Richer =session/update= support for tool calls and plans (full lifecycle, not only =rawOutput=).
 
 * UI Notes (current state)
 - Chat buffer major mode: =cursor-acp-chat-mode= derived from =markdown-mode= (when installed).
