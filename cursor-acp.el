@@ -53,6 +53,7 @@
   spinner-timer
   assistant-frag
   draft-input
+  main-buffer
   chat-buffer
   input-buffer
   info-buffer
@@ -141,6 +142,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
                   :spinner-timer nil
                   :assistant-frag ""
                   :draft-input ""
+                  :main-buffer nil
                   :chat-buffer nil
                   :input-buffer nil
                   :info-buffer nil
@@ -447,6 +449,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
   (list
    "C-c C-s  start/connect"
    "C-c C-k  hard stop"
+   "C-c C-r  reset layout"
    "C-c C-l  show logs"
    "C-c C-i  show info"
    "C-c C-p  focus input"
@@ -489,6 +492,66 @@ This uses `markdown-mode' markup-hiding overlays when available."
 (defun cursor-acp-focus-input ()
   (interactive)
   (cursor-acp--input-focus (cursor-acp--ensure-session)))
+
+(defun cursor-acp--acp-buffer-p (sess buf)
+  (and (buffer-live-p buf)
+       (memq buf
+             (list (cursor-acp--session-chat-buffer sess)
+                   (cursor-acp--session-input-buffer sess)
+                   (cursor-acp--session-info-buffer sess)
+                   (cursor-acp--session-log-buffer sess)))))
+
+(defun cursor-acp--preferred-main-buffer ()
+  (let* ((sess (cursor-acp--ensure-session))
+         (chat (cursor-acp--session-chat-buffer sess))
+         (input (cursor-acp--session-input-buffer sess))
+         (info (cursor-acp--session-info-buffer sess))
+         (log (cursor-acp--session-log-buffer sess))
+         (cur (window-buffer (selected-window))))
+    (if (memq cur (list chat input info log))
+        (or (cl-find-if
+             (lambda (b) (and (buffer-live-p b) (not (memq b (list chat input info log)))))
+             (buffer-list))
+            (other-buffer cur t))
+      cur)))
+
+(defun cursor-acp-reset-layout ()
+  "Reset ACP windows in current frame to the default layout."
+  (interactive)
+  (let* ((sess (cursor-acp--ensure-session))
+         (chat (cursor-acp--session-chat-buffer sess))
+         (input (cursor-acp--session-input-buffer sess))
+         (info (cursor-acp--session-info-buffer sess))
+         (log (cursor-acp--session-log-buffer sess))
+         (saved-main (cursor-acp--session-main-buffer sess))
+         (main (if (cursor-acp--acp-buffer-p sess saved-main)
+                   (cursor-acp--preferred-main-buffer)
+                 saved-main))
+         (wins (window-list (selected-frame) 'no-minibuf)))
+    (dolist (w wins)
+      (let ((b (window-buffer w)))
+        (when (and (window-live-p w) (memq b (list info log)))
+          (ignore-errors (delete-window w)))))
+    (when (or (not (buffer-live-p main)) (minibufferp main))
+      (setq main (cursor-acp--preferred-main-buffer)))
+    (when (buffer-live-p main)
+      (switch-to-buffer main))
+    (delete-other-windows)
+    (let* ((win (selected-window))
+           (total (max 12 (window-total-height win)))
+           (bottom-height (max 8 (min (- total 4) (floor (* total 0.35)))))
+           (chat-win (split-window win (- bottom-height) 'below)))
+      (set-window-buffer chat-win chat)
+      (select-window chat-win)
+      (let ((input-win (split-window chat-win 5 'below)))
+        (set-window-buffer input-win input))
+      (with-current-buffer chat
+        (cursor-acp-chat-mode)
+        (setq-local header-line-format (cursor-acp--status-line sess)))
+      (with-current-buffer input
+        (cursor-acp-input-mode))
+      (cursor-acp--ensure-input-window-height sess)
+      (cursor-acp--input-focus sess))))
 
 (defun cursor-acp--chat-eob-p ()
   (>= (point) (max (point-min) (- (point-max) 2))))
@@ -627,6 +690,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
   (let ((map (copy-keymap special-mode-map)))
     (define-key map (kbd "C-c C-s") #'cursor-acp-start)
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
+    (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
     (define-key map (kbd "C-c C-m") #'cursor-acp-switch-mode)
@@ -1056,6 +1120,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-s") #'cursor-acp-start)
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
+    (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
     (define-key map (kbd "C-c C-i") #'cursor-acp-show-info)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
@@ -1083,6 +1148,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
   (let ((map (copy-keymap text-mode-map)))
     (define-key map (kbd "C-c C-s") #'cursor-acp-start)
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
+    (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
     (define-key map (kbd "C-c C-i") #'cursor-acp-show-info)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
@@ -1128,6 +1194,9 @@ This uses `markdown-mode' markup-hiding overlays when available."
   "Open the Cursor ACP buffer."
   (interactive)
   (let ((sess (cursor-acp--ensure-session)))
+    (let ((cur (current-buffer)))
+      (unless (cursor-acp--acp-buffer-p sess cur)
+        (setf (cursor-acp--session-main-buffer sess) cur)))
     (let ((chat (cursor-acp--session-chat-buffer sess))
           (input (cursor-acp--session-input-buffer sess)))
       (pop-to-buffer chat)
