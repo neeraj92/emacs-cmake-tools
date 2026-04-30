@@ -68,6 +68,7 @@
   available-models
   available-commands
   ui-expanded
+  tool-calls
   busy
   spinner-idx
   spinner-timer
@@ -108,6 +109,11 @@ This avoids inserting one token/word at a time when the server streams tiny chun
 
 This uses `markdown-mode' markup-hiding overlays when available."
   :type 'boolean
+  :group 'cursor-acp)
+
+(defcustom cursor-acp-pane-width 80
+  "Width in columns for the Cursor ACP right-side pane."
+  :type 'integer
   :group 'cursor-acp)
 
 (defun cursor-acp--ensure-sessions-table ()
@@ -171,6 +177,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
                   :available-models nil
                   :available-commands nil
                   :ui-expanded (make-hash-table :test #'equal)
+                  :tool-calls (make-hash-table :test #'equal)
                   :busy nil
                   :spinner-idx 0
                   :spinner-timer nil
@@ -311,6 +318,7 @@ This uses `markdown-mode' markup-hiding overlays when available."
                   :available-models nil
                   :available-commands nil
                   :ui-expanded (make-hash-table :test #'equal)
+                  :tool-calls (make-hash-table :test #'equal)
                   :busy nil
                   :spinner-idx 0
                   :spinner-timer nil

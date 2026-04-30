@@ -156,6 +156,7 @@ back to global `default-directory'."
   (setf (cursor-acp--session-permission-request-id sess) id)
   (setf (cursor-acp--session-permission-request-params sess) params)
   (cursor-acp--set-awaiting-permission sess t)
+  (cursor-acp--assistant-flush-frag sess)
   (condition-case _
       (let ((outcome (cursor-acp--prompt-permission-decision sess params)))
         (cursor-acp--rpc-respond sess id `((outcome . ,outcome)))
@@ -267,12 +268,37 @@ back to global `default-directory'."
                 (when (stringp txt)
                   (cursor-acp--chat-open-assistant target)
                   (cursor-acp--assistant-append target txt))))
+             ((string-equal kind "tool_call")
+              (let* ((tool-call-id (cursor-acp--ht-get update "toolCallId"))
+                     (title (cursor-acp--ht-get update "title"))
+                     (tc-kind (cursor-acp--ht-get update "kind"))
+                     (status (cursor-acp--ht-get update "status"))
+                     (ht (cursor-acp--session-tool-calls target))
+                     (id0 (and (stringp tool-call-id) (string-trim tool-call-id))))
+                (when (and (hash-table-p ht) (stringp id0) (not (string-empty-p id0)))
+                  (puthash id0
+                           `((title . ,title)
+                             (kind . ,tc-kind)
+                             (status . ,status))
+                           ht))))
              ((and (string-equal kind "tool_call_update")
-                   (cursor-acp--ht-get update "rawOutput"))
-              (cursor-acp--render-tool-call-raw-output
-               target
-               (cursor-acp--ht-get update "toolCallId")
-               (cursor-acp--ht-get update "rawOutput")))))
+                   (stringp (cursor-acp--ht-get update "status")))
+              (let* ((tool-call-id (cursor-acp--ht-get update "toolCallId"))
+                     (status (cursor-acp--ht-get update "status"))
+                     (raw (cursor-acp--ht-get update "rawOutput"))
+                     (ht (cursor-acp--session-tool-calls target))
+                     (id0 (and (stringp tool-call-id) (string-trim tool-call-id)))
+                     (cached (and (hash-table-p ht) id0 (gethash id0 ht nil)))
+                     (title (and (listp cached) (cdr (assoc 'title cached)))))
+                (when (and (hash-table-p ht) (stringp id0) (not (string-empty-p id0)))
+                  (puthash id0
+                           `((title . ,title)
+                             (status . ,status)
+                             (rawOutputPresent . ,(and raw t)))
+                           ht))
+                (when (and (string-equal status "completed") raw)
+                  (cursor-acp--render-tool-call-completed
+                   target tool-call-id title raw))))))
           (cursor-acp--render-info target)))))))
 
 (defun cursor-acp--process-filter (proc chunk)
@@ -305,6 +331,7 @@ back to global `default-directory'."
          (conn (cursor-acp--ensure-conn)))
     (when (and sess (eq proc (cursor-acp--conn-process conn)))
       (cursor-acp--log sess "process" (string-trim event))
+      (cursor-acp--assistant-flush-frag sess)
       (cursor-acp--set-busy sess nil)
       (setf (cursor-acp--conn-process conn) nil)
       (ignore-errors

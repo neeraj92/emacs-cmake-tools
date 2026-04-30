@@ -50,6 +50,7 @@
       (user-error "No active turn to cancel"))
     (cursor-acp--cancel-pending-permission sess)
     (cursor-acp--rpc-notify sess "session/cancel" `((sessionId . ,sid)))
+    (cursor-acp--assistant-flush-frag sess)
     (cursor-acp--chat-insert sess "\n[cancel requested]\n" t)
     (message "Cancel requested; waiting for agent confirmation")))
 
@@ -80,6 +81,27 @@
        (cursor-acp--render-info sess)
        (signal (car err) (cdr err))))))
 
+(defun cursor-acp-new-session ()
+  "Create a new ACP session and switch UI to it."
+  (interactive)
+  (let* ((bootstrap (cursor-acp--ensure-session)))
+    (cursor-acp--ensure-connected-session bootstrap)
+    (let* ((base (or (cursor-acp--active-session) bootstrap))
+           (cwd (cursor-acp--workspace-root base))
+           (res (cursor-acp--rpc-call
+                 base "session/new"
+                 `((cwd . ,cwd)
+                   (mcpServers . []))))
+           (sid (and (hash-table-p res) (gethash "sessionId" res nil))))
+      (unless (stringp sid)
+        (user-error "ACP session/new did not return sessionId"))
+      (let ((target (cursor-acp--ensure-session-by-id sid nil cwd)))
+        (cursor-acp--set-active-session-id sid)
+        (cursor-acp--cache-session-new target res)
+        (cursor-acp--chat-clear target)
+        (cursor-acp-reset-layout)
+        (cursor-acp--render-info target)))))
+
 (defun cursor-acp-stop ()
   "Hard stop: kill `agent acp` and clear session state."
   (interactive)
@@ -104,6 +126,21 @@
   "Show the ACP log buffer."
   (interactive)
   (pop-to-buffer (cursor-acp--session-log-buffer (cursor-acp--ensure-session))))
+
+(defun cursor-acp-hide ()
+  "Hide Cursor ACP UI windows (chat/input pane) in the current frame."
+  (interactive)
+  (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session)))
+         (chat (cursor-acp--session-chat-buffer sess))
+         (input (cursor-acp--session-input-buffer sess)))
+    (dolist (buf (list chat input))
+      (when (buffer-live-p buf)
+        (dolist (w (get-buffer-window-list buf nil t))
+          (when (window-live-p w)
+            (ignore-errors (delete-window w))))))
+    (cursor-acp--delete-pane-windows (selected-frame))))
 
 (defun cursor-acp-switch-mode ()
   "Interactively switch ACP session mode."
@@ -234,42 +271,17 @@
             (cursor-acp--rpc-session-resume target sid)))))))
 
 (defun cursor-acp-reset-layout ()
-  "Reset ACP windows in current frame to the default layout."
+  "Restore the ACP right-side pane (chat + input) in the current frame."
   (interactive)
   (let* ((sess (cursor-acp--ensure-session))
-         (chat (cursor-acp--session-chat-buffer sess))
-         (input (cursor-acp--session-input-buffer sess))
          (info (cursor-acp--session-info-buffer sess))
          (log (cursor-acp--session-log-buffer sess))
-         (saved-main (cursor-acp--session-main-buffer sess))
-         (main (if (cursor-acp--acp-buffer-p sess saved-main)
-                   (cursor-acp--preferred-main-buffer)
-                 saved-main))
          (wins (window-list (selected-frame) 'no-minibuf)))
     (dolist (w wins)
       (let ((b (window-buffer w)))
         (when (and (window-live-p w) (memq b (list info log)))
           (ignore-errors (delete-window w)))))
-    (when (or (not (buffer-live-p main)) (minibufferp main))
-      (setq main (cursor-acp--preferred-main-buffer)))
-    (when (buffer-live-p main)
-      (switch-to-buffer main))
-    (delete-other-windows)
-    (let* ((win (selected-window))
-           (total (max 12 (window-total-height win)))
-           (bottom-height (max 8 (min (- total 4) (floor (* total 0.35)))))
-           (chat-win (split-window win (- bottom-height) 'below)))
-      (set-window-buffer chat-win chat)
-      (select-window chat-win)
-      (let ((input-win (split-window chat-win 5 'below)))
-        (set-window-buffer input-win input))
-      (with-current-buffer chat
-        (cursor-acp-chat-mode)
-        (setq-local header-line-format (cursor-acp--status-line sess)))
-      (with-current-buffer input
-        (cursor-acp-input-mode))
-      (cursor-acp--ensure-input-window-height sess)
-      (cursor-acp--input-focus sess))))
+    (cursor-acp--open-ui (or (cursor-acp--active-session) sess) t)))
 
 (defun cursor-acp ()
   "Open the Cursor ACP buffer."

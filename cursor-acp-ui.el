@@ -1,5 +1,6 @@
 ;;; cursor-acp-ui.el --- Cursor ACP UI -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
 (require 'cursor-acp-core)
 (autoload 'markdown-mode "markdown-mode" nil t)
 
@@ -61,6 +62,7 @@
 (defun cursor-acp--keys-items ()
   (list
    "C-c C-s  start/connect"
+   "C-c C-n  new session"
    "C-c C-k  hard stop"
    "C-c C-x  cancel turn"
    "C-c C-a  reprompt permission"
@@ -86,19 +88,90 @@
   (let* ((buf (cursor-acp--session-input-buffer sess))
          (win (and (buffer-live-p buf) (get-buffer-window buf t))))
     (when (window-live-p win)
-      (cond
-       ((fboundp 'set-window-text-height)
-        (ignore-errors (set-window-text-height win 5)))
-       (t
-        (let* ((cur (window-body-height win))
-               (delta (- 5 cur)))
-          (when (/= delta 0)
-            (ignore-errors (window-resize win delta)))))))))
+      (let* ((frame-lines (frame-height (window-frame win)))
+             (target (max window-min-height
+                          (max 3 (floor (* (max 10 frame-lines) 0.10))))))
+        (cond
+         ((fboundp 'set-window-text-height)
+          (ignore-errors (set-window-text-height win target)))
+         (t
+          (let* ((cur (window-body-height win))
+                 (delta (- target cur)))
+            (when (/= delta 0)
+              (ignore-errors (window-resize win delta))))))))))
+
+(defun cursor-acp--pane-window-p (win)
+  (and (window-live-p win)
+       (window-parameter win 'cursor-acp-pane)))
+
+(defun cursor-acp--pane-windows (&optional frame)
+  (let ((f (or frame (selected-frame))))
+    (cl-remove-if-not
+     #'cursor-acp--pane-window-p
+     (window-list f 'no-minibuf))))
+
+(defun cursor-acp--delete-pane-windows (&optional frame)
+  (dolist (w (cursor-acp--pane-windows frame))
+    (when (window-live-p w)
+      (ignore-errors (delete-window w)))))
+
+(defun cursor-acp--pane-allow-resize (win)
+  (when (window-live-p win)
+    (set-window-parameter win 'window-size-fixed nil)
+    (set-window-parameter win 'window-preserve-size nil)))
+
+(defun cursor-acp--pane-snap-width (win width)
+  (when (and (window-live-p win) (integerp width) (> width 0))
+    (cursor-acp--pane-allow-resize win)
+    (let* ((cur (window-total-width win))
+           (delta (- width cur)))
+      (when (/= delta 0)
+        (ignore-errors (window-resize win delta t t))))))
+
+(defun cursor-acp--ensure-pane (sess &optional force-width)
+  (let* ((chat (cursor-acp--session-chat-buffer sess))
+         (input (cursor-acp--session-input-buffer sess))
+         (chat-win
+          (or (cl-find-if
+               #'cursor-acp--pane-window-p
+               (get-buffer-window-list chat nil t))
+              (display-buffer-in-side-window
+               chat
+               `((side . right)
+                 (slot . 0)
+                 (window-width . ,cursor-acp-pane-width)
+                 (window-parameters . ((cursor-acp-pane . t))))))))
+    (when (window-live-p chat-win)
+      (set-window-parameter chat-win 'cursor-acp-pane t)
+      (set-window-dedicated-p chat-win t)
+      (cursor-acp--pane-allow-resize chat-win)
+      (when force-width
+        (cursor-acp--pane-snap-width chat-win cursor-acp-pane-width))
+      (let ((input-win
+             (or (cl-find-if
+                  #'cursor-acp--pane-window-p
+                  (get-buffer-window-list input nil t))
+                 (display-buffer-in-side-window
+                  input
+                  `((side . right)
+                    (slot . 1)
+                    (window-width . ,cursor-acp-pane-width)
+                    (window-height . 0.10)
+                    (window-parameters . ((cursor-acp-pane . t))))))))
+        (when (window-live-p input-win)
+          (set-window-parameter input-win 'cursor-acp-pane t)
+          (set-window-dedicated-p input-win t)
+          (cursor-acp--pane-allow-resize input-win)
+          (cursor-acp--ensure-input-window-height sess)
+          (cons chat-win input-win))))))
 
 (defun cursor-acp--input-focus (sess)
   (let ((buf (cursor-acp--session-input-buffer sess)))
     (when (buffer-live-p buf)
-      (pop-to-buffer buf)
+      (let ((win (or (get-buffer-window buf t)
+                     (cdr (cursor-acp--ensure-pane sess)))))
+        (when (window-live-p win)
+          (select-window win)))
       (cursor-acp--ensure-input-window-height sess)
       (goto-char (point-max))
       (when (and (featurep 'evil) (fboundp 'evil-insert-state))
@@ -261,6 +334,21 @@
     (setq-local cursor-acp--assistant-open nil))
   (cursor-acp--chat-insert sess "\n\n" t))
 
+(defun cursor-acp--assistant-flush-frag (sess)
+  "Flush any buffered assistant text without closing the assistant block."
+  (unless (string-empty-p (or (cursor-acp--session-assistant-frag sess) ""))
+    (cursor-acp--chat-insert sess (cursor-acp--session-assistant-frag sess) t 'cursor-acp-agent-text-face)
+    (setf (cursor-acp--session-assistant-frag sess) "")))
+
+(defun cursor-acp--truncate (s maxlen)
+  (let* ((s0 (if (stringp s) s (format "%s" (or s ""))))
+         (n (max 0 (or maxlen 0))))
+    (if (<= (length s0) n)
+        s0
+      (if (<= n 3)
+          (substring s0 0 n)
+        (concat (substring s0 0 (- n 3)) "...")))))
+
 (defun cursor-acp--permission-request-summary (params)
   (let* ((tool-call (and (hash-table-p params) (cursor-acp--ht-get params "toolCall")))
          (title (and (hash-table-p tool-call) (cursor-acp--ht-get tool-call "title")))
@@ -286,22 +374,24 @@
 (defun cursor-acp--render-permission-request (sess params)
   (let* ((tool-call (and (hash-table-p params) (cursor-acp--ht-get params "toolCall")))
          (title (and (hash-table-p tool-call) (cursor-acp--ht-get tool-call "title")))
+         (title-short (and title (cursor-acp--truncate title 75)))
          (summary (cursor-acp--permission-request-summary params))
-         (reason (cursor-acp--permission-request-reasons params)))
+         (reason (cursor-acp--permission-request-reasons params))
+         (reason-short (and reason (cursor-acp--truncate reason 100))))
     (with-current-buffer (cursor-acp--session-chat-buffer sess)
       (let ((end (point-max)))
         (cursor-acp--hide-markup-region (point-min) end)))
     (cursor-acp--chat-insert sess "\n" t)
-    (cursor-acp--chat-insert sess (propertize "Permission requested" 'face 'bold) t)
+    (cursor-acp--chat-insert sess (propertize "⚠ Permission requested" 'face '(bold warning)) t)
     (when (and (stringp summary) (not (string-empty-p summary)))
       (cursor-acp--chat-insert sess (concat " " summary) t))
     (cursor-acp--chat-insert sess "\n" t)
-    (when (and (stringp title) (not (string-empty-p title)))
-      (cursor-acp--chat-insert sess (concat "```sh\n" title "\n```\n") t))
-    (when (and (stringp reason) (not (string-empty-p reason)))
-      (cursor-acp--chat-insert sess (propertize "Reason" 'face 'bold) t)
+    (when (and (stringp title-short) (not (string-empty-p title-short)))
+      (cursor-acp--chat-insert sess (concat "```sh\n" title-short "\n```\n") t))
+    (when (and (stringp reason-short) (not (string-empty-p reason-short)))
+      (cursor-acp--chat-insert sess (propertize "ℹ Reason" 'face '(bold font-lock-keyword-face)) t)
       (cursor-acp--chat-insert sess ":\n" t)
-      (cursor-acp--chat-insert sess (concat reason "\n") t))))
+      (cursor-acp--chat-insert sess (concat reason-short "\n") t))))
 
 (defun cursor-acp--permission-prompt-select-option (options)
   (let* ((pairs (cl-loop for o in options
@@ -330,7 +420,10 @@
     (unless options
       (user-error "Permission request did not include options"))
     (let ((selected (cursor-acp--permission-prompt-select-option options)))
-      (cursor-acp--chat-insert sess (format "[permission selected] optionId=%s\n" selected) t)
+      (cursor-acp--chat-insert
+       sess
+       (propertize (format "✅ [permission selected] optionId=%s\n" selected) 'face '(bold success))
+       t)
       `((outcome . "selected") (optionId . ,selected)))))
 
 (defun cursor-acp--render-tool-call-raw-output (sess tool-call-id raw-output)
@@ -369,6 +462,15 @@
          (format "\n```text\n%s\n```\n" txt)
          t))))))
 
+(defun cursor-acp--render-tool-call-completed (sess tool-call-id title raw-output)
+  (cursor-acp--assistant-flush-frag sess)
+  (when (and (stringp title) (not (string-empty-p (string-trim title))))
+    (cursor-acp--chat-insert
+     sess
+     (concat "\n" (propertize (format "🛠 %s" title) 'face '(bold font-lock-function-name-face)) "\n")
+     t))
+  (cursor-acp--render-tool-call-raw-output sess tool-call-id raw-output))
+
 (defun cursor-acp--render-info (sess)
   (let ((buf (cursor-acp--session-info-buffer sess)))
     (when (buffer-live-p buf)
@@ -394,6 +496,7 @@
 (defvar cursor-acp--global-keys-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-s") #'cursor-acp-start)
+    (define-key map (kbd "C-c C-n") #'cursor-acp-new-session)
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
@@ -420,6 +523,7 @@
 (defvar cursor-acp-info-mode-map
   (let ((map (copy-keymap special-mode-map)))
     (define-key map (kbd "C-c C-s") #'cursor-acp-start)
+    (define-key map (kbd "C-c C-n") #'cursor-acp-new-session)
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
@@ -442,10 +546,22 @@
   (add-hook 'completion-at-point-functions #'cursor-acp--at-file-capf nil t)
   (add-hook 'post-self-insert-hook #'cursor-acp--maybe-trigger-at-file-completion nil t))
 
+(defun cursor-acp--space (&optional n)
+  (interactive "p")
+  (let ((n (or n 1)))
+    (if (and (eq major-mode 'cursor-acp-input-mode)
+             (bound-and-true-p completion-in-region-mode)
+             (eq (char-before) ?@))
+        (progn
+          (completion-in-region-mode -1)
+          (self-insert-command n))
+      (self-insert-command n))))
+
 (defvar cursor-acp-input-mode-map
   (let ((map (copy-keymap text-mode-map)))
     (define-key map (kbd "RET") #'cursor-acp-send)
     (define-key map (kbd "C-j") #'newline)
+    (define-key map (kbd "SPC") #'cursor-acp--space)
     (define-key map (kbd "C-c C-p") (lambda () (interactive) (cursor-acp--input-focus (cursor-acp--ensure-session))))
     map))
 
@@ -522,6 +638,15 @@
           (puthash r rel cursor-acp--at-file-cache)
           rel))))
 
+(defun cursor-acp--at-file-exit (str status)
+  (when (eq status 'finished)
+    (let* ((end (point))
+           (start (- end (length str)))
+           (at-pos (1- start)))
+      (when (and (>= at-pos (point-min))
+                 (eq (char-after at-pos) ?@))
+        (delete-region at-pos (1+ at-pos))))))
+
 (defun cursor-acp--at-file-capf ()
   "Completion for workspace files after '@' in ACP input buffers."
   (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
@@ -536,7 +661,8 @@
                    (eq (char-after at-pos) ?@))
           (list beg end
                 (cursor-acp--workspace-files (cursor-acp--workspace-root sess))
-                :exclusive 'no))))))
+                :exclusive 'no
+                :exit-function #'cursor-acp--at-file-exit))))))
 
 (defun cursor-acp--maybe-trigger-at-file-completion ()
   (when (and (eq major-mode 'cursor-acp-input-mode)
@@ -565,23 +691,21 @@
             (other-buffer cur t))
       cur)))
 
-(defun cursor-acp--open-ui (sess)
+(defun cursor-acp--open-ui (sess &optional force-width)
   (let ((cur (current-buffer)))
     (unless (cursor-acp--acp-buffer-p sess cur)
       (setf (cursor-acp--session-main-buffer sess) cur)))
-  (let ((chat (cursor-acp--session-chat-buffer sess))
-        (input (cursor-acp--session-input-buffer sess)))
-    (pop-to-buffer chat)
+  (let* ((chat (cursor-acp--session-chat-buffer sess))
+         (input (cursor-acp--session-input-buffer sess))
+         (wins (cursor-acp--ensure-pane sess force-width))
+         (chat-win (car wins)))
+    (when (window-live-p chat-win)
+      (set-window-buffer chat-win chat))
     (with-current-buffer chat
-      (cursor-acp-chat-mode))
-    (setq-local header-line-format (cursor-acp--status-line sess))
-    (unless (get-buffer-window input)
-      (let ((win (selected-window)))
-        (select-window (split-window win 5 'below))
-        (switch-to-buffer input)))
+      (cursor-acp-chat-mode)
+      (setq-local header-line-format (cursor-acp--status-line sess)))
     (with-current-buffer input
       (cursor-acp-input-mode))
-    (cursor-acp--ensure-input-window-height sess)
     (cursor-acp--input-focus sess)))
 
 (provide 'cursor-acp-ui)
