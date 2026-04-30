@@ -1,7 +1,50 @@
 ;;; cursor-acp-transport.el --- Cursor ACP transport -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
 (require 'cursor-acp-core)
 (require 'cursor-acp-ui)
+
+(defun cursor-acp--diff-block-p (obj)
+  (and (hash-table-p obj)
+       (let ((ty (cursor-acp--ht-get obj "type")))
+         (and (stringp ty) (string-equal ty "diff")))
+       (stringp (cursor-acp--ht-get obj "path"))
+       (stringp (or (cursor-acp--ht-get obj "newText")
+                    (cursor-acp--ht-get obj "new_text")))))
+
+(defun cursor-acp--diff-block-fields (diff-ht)
+  (let ((path (cursor-acp--ht-get diff-ht "path"))
+        (old (or (cursor-acp--ht-get diff-ht "oldText")
+                 (cursor-acp--ht-get diff-ht "old_text")))
+        (new (or (cursor-acp--ht-get diff-ht "newText")
+                 (cursor-acp--ht-get diff-ht "new_text"))))
+    (list path (and (stringp old) old) (and (stringp new) new))))
+
+(defun cursor-acp--collect-diff-blocks (obj)
+  (let (out)
+    (cl-labels
+        ((walk (x)
+           (cond
+            ((cursor-acp--diff-block-p x)
+             (push x out))
+            ((hash-table-p x)
+             (maphash (lambda (_k v) (walk v)) x))
+            ((vectorp x)
+             (mapc #'walk (append x nil)))
+            ((listp x)
+             (mapc #'walk x)))))
+      (walk obj))
+    (nreverse out)))
+
+(defun cursor-acp--maybe-render-diffs-from (sess obj)
+  (condition-case _
+      (dolist (d (cursor-acp--collect-diff-blocks obj))
+        (pcase-let ((`(,path ,old-text ,new-text) (cursor-acp--diff-block-fields d)))
+          (when (and (stringp path) (stringp new-text))
+            (condition-case _
+                (cursor-acp--render-diff-block sess path (or old-text "") new-text)
+              (error nil)))))
+    (error nil)))
 
 (defun cursor-acp--rpc-respond-error (sess id code message &optional data)
   (let* ((err `((code . ,code) (message . ,message)
@@ -201,7 +244,12 @@ back to global `default-directory'."
          (cursor-acp--rpc-respond-error sess id -32602 (error-message-string err)))))
      ((and id method (string-equal method "fs/write_text_file"))
       (condition-case err
-          (cursor-acp--rpc-respond sess id (cursor-acp--fs-write-text-file sess (gethash "params" msg nil)))
+          (let* ((params (gethash "params" msg nil))
+                 (path (and (hash-table-p params) (gethash "path" params nil))))
+            (cursor-acp--fs-write-text-file sess params)
+            (when (stringp path)
+              (cursor-acp--render-write-text-file sess path))
+            (cursor-acp--rpc-respond sess id nil))
         (error
          (cursor-acp--rpc-respond-error sess id -32602 (error-message-string err)))))
 
@@ -285,20 +333,27 @@ back to global `default-directory'."
                    (stringp (cursor-acp--ht-get update "status")))
               (let* ((tool-call-id (cursor-acp--ht-get update "toolCallId"))
                      (status (cursor-acp--ht-get update "status"))
+                     (content (cursor-acp--ht-get update "content"))
                      (raw (cursor-acp--ht-get update "rawOutput"))
                      (ht (cursor-acp--session-tool-calls target))
                      (id0 (and (stringp tool-call-id) (string-trim tool-call-id)))
                      (cached (and (hash-table-p ht) id0 (gethash id0 ht nil)))
-                     (title (and (listp cached) (cdr (assoc 'title cached)))))
+                     (title (and (listp cached) (cdr (assoc 'title cached))))
+                     (tc-kind (and (listp cached) (cdr (assoc 'kind cached)))))
                 (when (and (hash-table-p ht) (stringp id0) (not (string-empty-p id0)))
                   (puthash id0
                            `((title . ,title)
+                             (kind . ,tc-kind)
                              (status . ,status)
                              (rawOutputPresent . ,(and raw t)))
                            ht))
-                (when (and (string-equal status "completed") raw)
-                  (cursor-acp--render-tool-call-completed
-                   target tool-call-id title raw))))))
+                (when (string-equal status "completed")
+                  (when content
+                    (cursor-acp--maybe-render-diffs-from target content))
+                  (when raw
+                    (cursor-acp--maybe-render-diffs-from target raw)
+                    (cursor-acp--render-tool-call-completed
+                     target tool-call-id title raw tc-kind)))))))
           (cursor-acp--render-info target)))))))
 
 (defun cursor-acp--process-filter (proc chunk)

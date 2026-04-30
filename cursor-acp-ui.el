@@ -198,7 +198,8 @@
           (when face
             (add-face-text-property start (point) face 'append))
           (when read-only
-            (put-text-property start (point) 'read-only t)))))
+            (put-text-property start (point) 'read-only t))
+          (cons start (point)))))
     (with-current-buffer buf
       (when (and (bound-and-true-p font-lock-mode) (fboundp 'font-lock-ensure))
         (font-lock-ensure (max (point-min) (- (point-max) (length s))) (point-max))))
@@ -240,6 +241,9 @@
       (cursor-acp--chat-insert sess "\n" t)
       (cursor-acp--chat-insert-prefix sess 'cursor-acp-agent-prefix-face))))
 
+(defun cursor-acp--in-diff-p (pos)
+  (get-text-property pos 'cursor-acp-diff))
+
 (defun cursor-acp--hide-markup-region (beg end)
   (when (and (integerp beg) (integerp end) (< beg end))
     (save-excursion
@@ -256,63 +260,69 @@
                           (looking-at "^\\s-*|.*|\\s-*$"))
                 (forward-line 1))
               (let ((tbl-end (point)))
-                (save-excursion
-                  (goto-char tbl-beg)
-                  (let (rows widths)
-                    (while (< (point) tbl-end)
-                      (let* ((line (buffer-substring-no-properties
-                                    (line-beginning-position) (line-end-position)))
-                             (cells (mapcar #'string-trim (split-string line "|" t))))
-                        (setq cells (cl-remove-if (lambda (c) (string-empty-p (string-trim c))) cells))
-                        (unless (or (null cells)
-                                    (cl-every (lambda (c) (string-match-p "\\`[: -]+\\'" c)) cells))
-                          (push cells rows)
-                          (dotimes (i (length cells))
-                            (let ((w (length (nth i cells))))
-                              (if (nth i widths)
-                                  (setf (nth i widths) (max (nth i widths) w))
-                                (setq widths (append widths (list w))))))))
-                      (forward-line 1))
-                    (setq rows (nreverse rows))
-                    (when (and rows widths)
-                      (let* ((render
-                              (mapconcat
-                               (lambda (r)
-                                 (mapconcat
-                                  (lambda (i)
-                                    (let* ((c (or (nth i r) ""))
-                                           (w (nth i widths)))
-                                      (format (format "%%-%ds" w) c)))
-                                  (number-sequence 0 (1- (length widths)))
-                                  "  "))
-                               rows
-                               "\n"))
-                             (ov (make-overlay tbl-beg tbl-end)))
-                        (overlay-put ov 'cursor-acp-table t)
-                        (overlay-put ov 'display render)))))))))
+                (unless (or (cursor-acp--in-diff-p tbl-beg)
+                            (cursor-acp--in-diff-p (max (point-min) (1- tbl-end))))
+                  (save-excursion
+                    (goto-char tbl-beg)
+                    (let (rows widths)
+                      (while (< (point) tbl-end)
+                        (let* ((line (buffer-substring-no-properties
+                                      (line-beginning-position) (line-end-position)))
+                               (cells (mapcar #'string-trim (split-string line "|" t))))
+                          (setq cells (cl-remove-if (lambda (c) (string-empty-p (string-trim c))) cells))
+                          (unless (or (null cells)
+                                      (cl-every (lambda (c) (string-match-p "\\`[: -]+\\'" c)) cells))
+                            (push cells rows)
+                            (dotimes (i (length cells))
+                              (let ((w (length (nth i cells))))
+                                (if (nth i widths)
+                                    (setf (nth i widths) (max (nth i widths) w))
+                                  (setq widths (append widths (list w))))))))
+                        (forward-line 1))
+                      (setq rows (nreverse rows))
+                      (when (and rows widths)
+                        (let* ((render
+                                (mapconcat
+                                 (lambda (r)
+                                   (mapconcat
+                                    (lambda (i)
+                                      (let* ((c (or (nth i r) ""))
+                                             (w (nth i widths)))
+                                        (format (format "%%-%ds" w) c)))
+                                    (number-sequence 0 (1- (length widths)))
+                                    "  "))
+                                 rows
+                                 "\n"))
+                               (ov (make-overlay tbl-beg tbl-end)))
+                          (overlay-put ov 'cursor-acp-table t)
+                          (overlay-put ov 'display render))))))))))
           (goto-char (point-min))
           (while (re-search-forward "^\\(#+\\)\\(\\s-+\\)" nil t)
-            (let ((ov1 (make-overlay (match-beginning 1) (match-end 1)))
-                  (ov2 (make-overlay (match-beginning 2) (match-end 2))))
-              (overlay-put ov1 'cursor-acp-md-hide t)
-              (overlay-put ov1 'display "")
-              (overlay-put ov2 'cursor-acp-md-hide t)
-              (overlay-put ov2 'display "")))
+            (unless (cursor-acp--in-diff-p (match-beginning 0))
+              (let ((ov1 (make-overlay (match-beginning 1) (match-end 1)))
+                    (ov2 (make-overlay (match-beginning 2) (match-end 2))))
+                (overlay-put ov1 'cursor-acp-md-hide t)
+                (overlay-put ov1 'display "")
+                (overlay-put ov2 'cursor-acp-md-hide t)
+                (overlay-put ov2 'display ""))))
           (goto-char (point-min))
           (while (re-search-forward "\\(\\*\\*\\|__\\|\\*\\|_\\)" nil t)
-            (let ((ov (make-overlay (match-beginning 1) (match-end 1))))
-              (overlay-put ov 'cursor-acp-md-hide t)
-              (overlay-put ov 'display "")))
+            (unless (cursor-acp--in-diff-p (match-beginning 0))
+              (let ((ov (make-overlay (match-beginning 1) (match-end 1))))
+                (overlay-put ov 'cursor-acp-md-hide t)
+                (overlay-put ov 'display ""))))
           (goto-char (point-min))
           (while (re-search-forward "`" nil t)
-            (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
-              (overlay-put ov 'cursor-acp-md-hide t)
-              (overlay-put ov 'display "")))
+            (unless (cursor-acp--in-diff-p (match-beginning 0))
+              (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
+                (overlay-put ov 'cursor-acp-md-hide t)
+                (overlay-put ov 'display ""))))
           (goto-char (point-min))
           (while (re-search-forward "^```.*$" nil t)
-            (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
-              (overlay-put ov 'cursor-acp-md-hide t)
-              (overlay-put ov 'display "")))))))
+            (unless (cursor-acp--in-diff-p (match-beginning 0))
+              (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
+                (overlay-put ov 'cursor-acp-md-hide t)
+                (overlay-put ov 'display ""))))))))
 
 (defun cursor-acp--assistant-append (sess txt)
   (setf (cursor-acp--session-assistant-frag sess)
@@ -320,7 +330,11 @@
   (when (or (string-match-p "\n" (or txt ""))
             (>= (cursor-acp--count-words (cursor-acp--session-assistant-frag sess))
                 cursor-acp-chat-flush-words))
-    (cursor-acp--chat-insert sess (cursor-acp--session-assistant-frag sess) t 'cursor-acp-agent-text-face)
+    (let* ((frag (cursor-acp--session-assistant-frag sess))
+           (range (cursor-acp--chat-insert sess frag t 'cursor-acp-agent-text-face)))
+      (when (and cursor-acp-markdown-hide-markup (consp range))
+        (with-current-buffer (cursor-acp--session-chat-buffer sess)
+          (cursor-acp--hide-markup-region (car range) (cdr range)))))
     (setf (cursor-acp--session-assistant-frag sess) "")))
 
 (defun cursor-acp--assistant-end-turn (sess)
@@ -426,7 +440,18 @@
        t)
       `((outcome . "selected") (optionId . ,selected)))))
 
-(defun cursor-acp--render-tool-call-raw-output (sess tool-call-id raw-output)
+(defun cursor-acp--truncate-string (s maxlen)
+  (let ((s0 (if (stringp s) s (format "%s" (or s ""))))
+        (n (max 0 (or maxlen 0))))
+    (if (<= (length s0) n)
+        s0
+      (if (<= n 3) (substring s0 0 n) (concat (substring s0 0 (- n 3)) "...")))))
+
+(defun cursor-acp--read-tool-kind-p (tool-kind)
+  (let ((k (and (stringp tool-kind) (downcase (string-trim tool-kind)))))
+    (and k (member k '("read" "read_file" "readfile" "read file" "fs/read_text_file")))))
+
+(defun cursor-acp--render-tool-call-raw-output (sess tool-call-id raw-output &optional tool-kind)
   (ignore tool-call-id)
   (cond
    ((hash-table-p raw-output)
@@ -442,7 +467,9 @@
            (unless skip
              (let* ((key (format "%s" k))
                     (txt (if (stringp v)
-                             v
+                             (if (cursor-acp--read-tool-kind-p tool-kind)
+                                 (cursor-acp--truncate-string v 100)
+                               v)
                            (condition-case _
                                (json-serialize v :pretty t :null-object :null :false-object :json-false)
                              (error (format "%S" v))))))
@@ -452,7 +479,9 @@
         (cursor-acp--chat-insert sess (concat "\n" (mapconcat #'identity (nreverse sections) "")) t))))
    (t
     (let ((txt (if (stringp raw-output)
-                   raw-output
+                   (if (cursor-acp--read-tool-kind-p tool-kind)
+                       (cursor-acp--truncate-string raw-output 100)
+                     raw-output)
                  (condition-case _
                      (json-serialize raw-output :pretty t :null-object :null :false-object :json-false)
                    (error (format "%S" raw-output))))))
@@ -462,14 +491,122 @@
          (format "\n```text\n%s\n```\n" txt)
          t))))))
 
-(defun cursor-acp--render-tool-call-completed (sess tool-call-id title raw-output)
+(defun cursor-acp--render-tool-call-completed (sess tool-call-id title raw-output &optional tool-kind)
   (cursor-acp--assistant-flush-frag sess)
   (when (and (stringp title) (not (string-empty-p (string-trim title))))
     (cursor-acp--chat-insert
      sess
      (concat "\n" (propertize (format "🛠 %s" title) 'face '(bold font-lock-function-name-face)) "\n")
      t))
-  (cursor-acp--render-tool-call-raw-output sess tool-call-id raw-output))
+  (cursor-acp--render-tool-call-raw-output sess tool-call-id raw-output tool-kind))
+
+(defun cursor-acp--diff-added-face ()
+  (cond
+   ((facep 'magit-diff-added) 'magit-diff-added)
+   ((facep 'diff-added) 'diff-added)
+   (t 'success)))
+
+(defun cursor-acp--diff-removed-face ()
+  (cond
+   ((facep 'magit-diff-removed) 'magit-diff-removed)
+   ((facep 'diff-removed) 'diff-removed)
+   (t 'error)))
+
+(defcustom cursor-acp-diff-preview-lines 20
+  "Maximum number of lines to display for diff previews in the chat buffer."
+  :type 'integer
+  :group 'cursor-acp)
+
+(defun cursor-acp--diff-preview (text)
+  (let* ((lines (split-string (or text "") "\n" nil))
+         (n (max 0 (min (or cursor-acp-diff-preview-lines 20) (length lines))))
+         (shown (cl-subseq lines 0 n)))
+    (cons (if shown (concat (string-join shown "\n") "\n") "")
+          (- (length lines) n))))
+
+(defun cursor-acp--diff-run-unified (sess path old-text new-text)
+  (let* ((sid (or (and (cursor-acp--valid-session-p sess)
+                       (cursor-acp--session-session-id sess))
+                  "no-session"))
+         (base (format "cursor-acp-%s-" (replace-regexp-in-string "[^A-Za-z0-9_.-]" "_" sid)))
+         (old-file (make-temp-file base nil ".old"))
+         (new-file (make-temp-file base nil ".new")))
+    (unwind-protect
+        (progn
+          (with-temp-file old-file
+            (insert (or old-text "")))
+          (with-temp-file new-file
+            (insert (or new-text "")))
+          (with-temp-buffer
+            (let ((code (call-process
+                         "diff" nil t nil
+                         "-u"
+                         "--label" (format "a/%s" (or path "old"))
+                         "--label" (format "b/%s" (or path "new"))
+                         old-file new-file)))
+              (cond
+               ((or (eq code 0) (eq code 1))
+                (buffer-string))
+               (t
+                (format "diff failed (exit=%s)\n" code))))))
+      (ignore-errors (delete-file old-file))
+      (ignore-errors (delete-file new-file)))))
+
+(defun cursor-acp--apply-diff-faces (beg end)
+  (save-excursion
+    (goto-char beg)
+    (while (< (point) end)
+      (let* ((lb (line-beginning-position))
+             (le (min (line-end-position) end)))
+        (when (< lb le)
+          (cond
+           ((looking-at-p "^\\+\\+\\+\\|^---\\|^@@")
+            (add-face-text-property lb le 'bold 'append))
+           ((looking-at-p "^\\+")
+            (add-face-text-property lb le (cursor-acp--diff-added-face) 'append))
+           ((looking-at-p "^-")
+            (add-face-text-property lb le (cursor-acp--diff-removed-face) 'append))))
+        (forward-line 1)))))
+
+(defun cursor-acp--render-diff-block (sess path old-text new-text)
+  (cursor-acp--assistant-flush-frag sess)
+  (let* ((p (or path "(unknown path)"))
+         (diff (cursor-acp--diff-run-unified sess p (or old-text "") (or new-text "")))
+         (preview (cursor-acp--diff-preview diff))
+         (txt (car preview))
+         (remaining (cdr preview)))
+    (let* ((chat (cursor-acp--session-chat-buffer sess))
+           (w (or (and (buffer-live-p chat)
+                       (get-buffer-window chat t)
+                       (window-body-width (get-buffer-window chat t) t))
+                  80))
+           (sep (concat (make-string (max 10 (min 120 w)) ?─) "\n")))
+      (with-current-buffer chat
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (let ((block-beg (point)))
+            (insert "\n" sep)
+            (insert (propertize (format "🔍 Diff: %s" p) 'face '(bold font-lock-keyword-face)) "\n")
+            (insert sep)
+            (insert "```diff\n")
+            (insert txt)
+            (insert "```\n")
+            (when (> remaining 0)
+              (insert (propertize (format "… (%d more lines)\n" remaining) 'face 'shadow)))
+            (insert sep)
+            (put-text-property block-beg (point) 'read-only t)
+            (when (and (bound-and-true-p font-lock-mode) (fboundp 'font-lock-ensure))
+              (font-lock-ensure block-beg (point)))
+            (cursor-acp--hide-markup-region block-beg (point))))))))
+
+(defun cursor-acp--render-write-text-file (sess path)
+  (cursor-acp--assistant-flush-frag sess)
+  (cursor-acp--chat-insert
+   sess
+   (concat "\n" (propertize (format "✍ Wrote: %s" (or path "(unknown path)"))
+                            'face '(bold font-lock-keyword-face))
+           "\n")
+   t))
 
 (defun cursor-acp--render-info (sess)
   (let ((buf (cursor-acp--session-info-buffer sess)))
@@ -612,8 +749,6 @@
       (kbd "C-c C-i") #'cursor-acp-show-info
       (kbd "C-c C-p") #'cursor-acp-focus-input)))
 
-(defvar cursor-acp--at-file-cache (make-hash-table :test #'equal))
-
 (defun cursor-acp--path-has-hidden-component-p (path)
   (let* ((parts (split-string (directory-file-name path) "/" t)))
     (catch 'hidden
@@ -625,18 +760,14 @@
 
 (defun cursor-acp--workspace-files (root)
   (let* ((r (file-name-as-directory (expand-file-name root)))
-         (cached (gethash r cursor-acp--at-file-cache)))
-    (or cached
-        (let* ((all (ignore-errors (directory-files-recursively r ".*" nil nil)))
-               (files
-                (cl-remove-if
-                 (lambda (p)
-                   (or (not (stringp p))
-                       (cursor-acp--path-has-hidden-component-p (file-relative-name p r))))
-                 all))
-               (rel (sort (mapcar (lambda (p) (file-relative-name p r)) files) #'string-lessp)))
-          (puthash r rel cursor-acp--at-file-cache)
-          rel))))
+         (all (ignore-errors (directory-files-recursively r ".*" nil nil)))
+         (files
+          (cl-remove-if
+           (lambda (p)
+             (or (not (stringp p))
+                 (cursor-acp--path-has-hidden-component-p (file-relative-name p r))))
+           all)))
+    (sort (mapcar (lambda (p) (file-relative-name p r)) files) #'string-lessp)))
 
 (defun cursor-acp--at-file-exit (str status)
   (when (eq status 'finished)
