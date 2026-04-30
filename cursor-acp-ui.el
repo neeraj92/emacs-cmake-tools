@@ -67,6 +67,7 @@
    "C-c C-x  cancel turn"
    "C-c C-a  reprompt permission"
    "C-c C-r  reset layout"
+   "C-c C-v  review file edits (ediff)"
    "C-c C-w  switch session"
    "C-c C-l  show logs"
    "C-c C-i  show info"
@@ -638,6 +639,7 @@
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
     (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
+    (define-key map (kbd "C-c C-v") #'cursor-acp-review)
     (define-key map (kbd "C-c C-w") #'cursor-acp-switch-session)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
     (define-key map (kbd "C-c C-i") #'cursor-acp-show-info)
@@ -665,6 +667,7 @@
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
     (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
+    (define-key map (kbd "C-c C-v") #'cursor-acp-review)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
     (define-key map (kbd "C-c C-m") #'cursor-acp-switch-mode)

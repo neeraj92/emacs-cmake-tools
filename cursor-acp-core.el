@@ -116,6 +116,75 @@ This uses `markdown-mode' markup-hiding overlays when available."
   :type 'integer
   :group 'cursor-acp)
 
+(defcustom cursor-acp-review-root-dir
+  (let ((xdg (getenv "XDG_CONFIG_HOME")))
+    (expand-file-name
+     "emacs-cursor-acp/diffs/"
+     (if (and (stringp xdg) (not (string-empty-p (string-trim xdg))))
+         (file-name-as-directory (expand-file-name xdg))
+       (expand-file-name "~/.config/"))))
+  "Root directory for Cursor ACP review seeds.
+
+Seeds are stored per project (workspace root) under this directory."
+  :type 'directory
+  :group 'cursor-acp)
+
+(defun cursor-acp--review--sanitize (s)
+  (replace-regexp-in-string "[^A-Za-z0-9_.-]" "_" (or s "")))
+
+(defun cursor-acp--review-project-dir (sess)
+  (let* ((root (cursor-acp--workspace-root sess))
+         (key (cursor-acp--review--sanitize (directory-file-name (expand-file-name root)))))
+    (file-name-as-directory (expand-file-name key cursor-acp-review-root-dir))))
+
+(defun cursor-acp--review-seed-path (sess abs-path)
+  (let* ((root (cursor-acp--workspace-root sess))
+         (rel (file-relative-name (expand-file-name abs-path) (file-name-as-directory (expand-file-name root))))
+         (proj (cursor-acp--review-project-dir sess)))
+    (expand-file-name rel proj)))
+
+(defun cursor-acp--review-seed-exists-p (sess abs-path)
+  (file-exists-p (cursor-acp--review-seed-path sess abs-path)))
+
+(defun cursor-acp--review-ensure-seed (sess abs-path seed-text)
+  (let* ((seed (cursor-acp--review-seed-path sess abs-path))
+         (dir (file-name-directory seed)))
+    (unless (file-exists-p seed)
+      (when (and (stringp dir) (not (file-directory-p dir)))
+        (make-directory dir t))
+      (with-temp-buffer
+        (insert (or seed-text ""))
+        (write-region (point-min) (point-max) seed nil 'quiet)))
+    seed))
+
+(defun cursor-acp--review-delete-seed (sess abs-path)
+  (let ((seed (cursor-acp--review-seed-path sess abs-path)))
+    (when (file-exists-p seed)
+      (ignore-errors (delete-file seed))
+      t)))
+
+(defun cursor-acp--review-seed-text (sess abs-path)
+  (let ((seed (cursor-acp--review-seed-path sess abs-path)))
+    (when (file-readable-p seed)
+      (with-temp-buffer
+        (insert-file-contents seed)
+        (buffer-substring-no-properties (point-min) (point-max))))))
+
+(defun cursor-acp--review-file-text (abs-path)
+  (cond
+   ((not (stringp abs-path)) "")
+   ((buffer-live-p (get-file-buffer abs-path))
+    (with-current-buffer (get-file-buffer abs-path)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (buffer-substring-no-properties (point-min) (point-max))))))
+   ((file-readable-p abs-path)
+    (with-temp-buffer
+      (insert-file-contents abs-path)
+      (buffer-substring-no-properties (point-min) (point-max))))
+   (t "")))
+
 (defun cursor-acp--ensure-sessions-table ()
   (unless (hash-table-p cursor-acp--sessions)
     (setq cursor-acp--sessions (make-hash-table :test #'equal)))

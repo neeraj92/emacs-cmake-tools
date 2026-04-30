@@ -42,7 +42,13 @@
         (pcase-let ((`(,path ,old-text ,new-text) (cursor-acp--diff-block-fields d)))
           (when (and (stringp path) (stringp new-text))
             (condition-case _
-                (cursor-acp--render-diff-block sess path (or old-text "") new-text)
+                (let* ((root (cursor-acp--workspace-root sess))
+                       (abs (if (file-name-absolute-p path)
+                                (expand-file-name path)
+                              (expand-file-name path root))))
+                  (when (cursor-acp--path-in-workspace-p abs (cursor-acp--session-workspace-root sess))
+                    (cursor-acp--review-ensure-seed sess abs (or old-text (cursor-acp--review-file-text abs))))
+                  (cursor-acp--render-diff-block sess path (or old-text "") new-text))
               (error nil)))))
     (error nil)))
 
@@ -123,6 +129,8 @@ back to global `default-directory'."
       (error "Path is outside workspace root: %s" root))
     (unless (stringp content)
       (error "fs/write_text_file requires string content"))
+    (let ((seed (cursor-acp--review-file-text path)))
+      (cursor-acp--review-ensure-seed sess path seed))
     (let ((parent (file-name-directory (expand-file-name path))))
       (when (and (stringp parent) (not (file-directory-p parent)))
         (make-directory parent t)))
