@@ -3,6 +3,7 @@
 (require 'cl-lib)
 (require 'cursor-acp-core)
 (autoload 'markdown-mode "markdown-mode" nil t)
+(autoload 'gfm-mode "markdown-mode" nil t)
 
 (defvar-local cursor-acp--assistant-open nil)
 (defvar-local cursor-acp--assistant-start nil)
@@ -66,6 +67,7 @@
    "C-c C-k  hard stop"
    "C-c C-x  cancel turn"
    "C-c C-a  reprompt permission"
+   "C-c C-b  reprompt ask question"
    "C-c C-r  reset layout"
    "C-c C-v  review file edits (ediff)"
    "C-c C-w  switch session"
@@ -87,6 +89,22 @@
 
 (defun cursor-acp--ensure-input-window-height (sess)
   (let* ((buf (cursor-acp--session-input-buffer sess))
+         (win (and (buffer-live-p buf) (get-buffer-window buf t))))
+    (when (window-live-p win)
+      (let* ((frame-lines (frame-height (window-frame win)))
+             (target (max window-min-height
+                          (max 3 (floor (* (max 10 frame-lines) 0.10))))))
+        (cond
+         ((fboundp 'set-window-text-height)
+          (ignore-errors (set-window-text-height win target)))
+         (t
+          (let* ((cur (window-body-height win))
+                 (delta (- target cur)))
+            (when (/= delta 0)
+              (ignore-errors (window-resize win delta))))))))))
+
+(defun cursor-acp--ensure-plan-window-height (sess)
+  (let* ((buf (cursor-acp--session-plan-buffer sess))
          (win (and (buffer-live-p buf) (get-buffer-window buf t))))
     (when (window-live-p win)
       (let* ((frame-lines (frame-height (window-frame win)))
@@ -132,6 +150,7 @@
 (defun cursor-acp--ensure-pane (sess &optional force-width)
   (let* ((chat (cursor-acp--session-chat-buffer sess))
          (input (cursor-acp--session-input-buffer sess))
+         (plan (cursor-acp--session-plan-buffer sess))
          (chat-win
           (or (cl-find-if
                #'cursor-acp--pane-window-p
@@ -155,7 +174,7 @@
                  (display-buffer-in-side-window
                   input
                   `((side . right)
-                    (slot . 1)
+                    (slot . ,(if (buffer-live-p plan) 2 1))
                     (window-width . ,cursor-acp-pane-width)
                     (window-height . 0.10)
                     (window-parameters . ((cursor-acp-pane . t))))))))
@@ -163,8 +182,76 @@
           (set-window-parameter input-win 'cursor-acp-pane t)
           (set-window-dedicated-p input-win t)
           (cursor-acp--pane-allow-resize input-win)
+          (when (buffer-live-p plan)
+            (let ((plan-win
+                   (or (cl-find-if
+                        #'cursor-acp--pane-window-p
+                        (get-buffer-window-list plan nil t))
+                       (display-buffer-in-side-window
+                        plan
+                        `((side . right)
+                          (slot . 1)
+                          (window-width . ,cursor-acp-pane-width)
+                          (window-height . 0.10)
+                          (window-parameters . ((cursor-acp-pane . t))))))))
+              (when (window-live-p plan-win)
+                (set-window-parameter plan-win 'cursor-acp-pane t)
+                (set-window-dedicated-p plan-win t)
+                (cursor-acp--pane-allow-resize plan-win)
+                (cursor-acp--ensure-plan-window-height sess))))
           (cursor-acp--ensure-input-window-height sess)
           (cons chat-win input-win))))))
+
+(defun cursor-acp--format-plan-todo-line (entry)
+  (let* ((content (and (hash-table-p entry) (cursor-acp--ht-get entry "content")))
+         (status0 (and (hash-table-p entry) (cursor-acp--ht-get entry "status")))
+         (status (when (stringp status0) (downcase status0)))
+         (label (string-trim (format "%s" (or content "")))))
+    (cond
+     ((string-equal status "completed")
+      (format "- [x] %s" label))
+     ((or (string-equal status "cancelled") (string-equal status "canceled"))
+      (format "- [ ] ~~%s~~" (replace-regexp-in-string "~" "∼" label)))
+     (t
+      (format "- [ ] %s" label)))))
+
+(defun cursor-acp--plan-todos-section-text (entries)
+  (with-temp-buffer
+    (insert "## Todos\n\n")
+    (let ((items (cursor-acp--normalize-items entries)))
+      (if (not items)
+          (insert "- (none)\n")
+        (dolist (e items)
+          (insert (cursor-acp--format-plan-todo-line e) "\n"))))
+    (buffer-string)))
+
+(defun cursor-acp--plan-buffer-after-insert-markdown-view ()
+  (when (and cursor-acp-markdown-hide-markup (boundp 'markdown-hide-markup))
+    (setq-local markdown-hide-markup t)
+    (ignore-errors
+      (when (fboundp 'font-lock-flush)
+        (font-lock-flush (point-min) (point-max)))
+      (when (fboundp 'font-lock-ensure)
+        (font-lock-ensure (point-min) (point-max))))))
+
+(defun cursor-acp--render-plan-entries (sess entries)
+  (let ((buf (or (cursor-acp--session-plan-buffer sess)
+                 (let ((b (get-buffer-create (format "*cursor-acp-plan: %s*"
+                                                     (cursor-acp--session-buffer-title sess)))))
+                   (setf (cursor-acp--session-plan-buffer sess) b)
+                   b))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (if (fboundp 'gfm-mode)
+            (gfm-mode)
+          (markdown-mode))
+        (insert (cursor-acp--plan-todos-section-text entries))
+        (cursor-acp--plan-buffer-after-insert-markdown-view)
+        (goto-char (point-min))
+        (setq-local buffer-read-only t)))
+    (cursor-acp--ensure-pane sess)
+    (cursor-acp--ensure-plan-window-height sess)))
 
 (defun cursor-acp--input-focus (sess)
   (let ((buf (cursor-acp--session-input-buffer sess)))
@@ -297,33 +384,33 @@
                                (ov (make-overlay tbl-beg tbl-end)))
                           (overlay-put ov 'cursor-acp-table t)
                           (overlay-put ov 'display render))))))))))
-          (goto-char (point-min))
-          (while (re-search-forward "^\\(#+\\)\\(\\s-+\\)" nil t)
-            (unless (cursor-acp--in-diff-p (match-beginning 0))
-              (let ((ov1 (make-overlay (match-beginning 1) (match-end 1)))
-                    (ov2 (make-overlay (match-beginning 2) (match-end 2))))
-                (overlay-put ov1 'cursor-acp-md-hide t)
-                (overlay-put ov1 'display "")
-                (overlay-put ov2 'cursor-acp-md-hide t)
-                (overlay-put ov2 'display ""))))
-          (goto-char (point-min))
-          (while (re-search-forward "\\(\\*\\*\\|__\\|\\*\\|_\\)" nil t)
-            (unless (cursor-acp--in-diff-p (match-beginning 0))
-              (let ((ov (make-overlay (match-beginning 1) (match-end 1))))
-                (overlay-put ov 'cursor-acp-md-hide t)
-                (overlay-put ov 'display ""))))
-          (goto-char (point-min))
-          (while (re-search-forward "`" nil t)
-            (unless (cursor-acp--in-diff-p (match-beginning 0))
-              (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
-                (overlay-put ov 'cursor-acp-md-hide t)
-                (overlay-put ov 'display ""))))
-          (goto-char (point-min))
-          (while (re-search-forward "^```.*$" nil t)
-            (unless (cursor-acp--in-diff-p (match-beginning 0))
-              (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
-                (overlay-put ov 'cursor-acp-md-hide t)
-                (overlay-put ov 'display ""))))))))
+        (goto-char (point-min))
+        (while (re-search-forward "^\\(#+\\)\\(\\s-+\\)" nil t)
+          (unless (cursor-acp--in-diff-p (match-beginning 0))
+            (let ((ov1 (make-overlay (match-beginning 1) (match-end 1)))
+                  (ov2 (make-overlay (match-beginning 2) (match-end 2))))
+              (overlay-put ov1 'cursor-acp-md-hide t)
+              (overlay-put ov1 'display "")
+              (overlay-put ov2 'cursor-acp-md-hide t)
+              (overlay-put ov2 'display ""))))
+        (goto-char (point-min))
+        (while (re-search-forward "\\(\\*\\*\\|__\\|\\*\\|_\\)" nil t)
+          (unless (cursor-acp--in-diff-p (match-beginning 0))
+            (let ((ov (make-overlay (match-beginning 1) (match-end 1))))
+              (overlay-put ov 'cursor-acp-md-hide t)
+              (overlay-put ov 'display ""))))
+        (goto-char (point-min))
+        (while (re-search-forward "`" nil t)
+          (unless (cursor-acp--in-diff-p (match-beginning 0))
+            (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
+              (overlay-put ov 'cursor-acp-md-hide t)
+              (overlay-put ov 'display ""))))
+        (goto-char (point-min))
+        (while (re-search-forward "^```.*$" nil t)
+          (unless (cursor-acp--in-diff-p (match-beginning 0))
+            (let ((ov (make-overlay (match-beginning 0) (match-end 0))))
+              (overlay-put ov 'cursor-acp-md-hide t)
+              (overlay-put ov 'display ""))))))))
 
 (defun cursor-acp--assistant-append (sess txt)
   (setf (cursor-acp--session-assistant-frag sess)
@@ -440,6 +527,92 @@
        (propertize (format "✅ [permission selected] optionId=%s\n" selected) 'face '(bold success))
        t)
       `((outcome . "selected") (optionId . ,selected)))))
+
+(defun cursor-acp--render-ask-question (sess params)
+  (let* ((title (and (hash-table-p params) (cursor-acp--ht-get params "title")))
+         (questions (cursor-acp--normalize-items
+                     (and (hash-table-p params) (cursor-acp--ht-get params "questions")))))
+    (with-current-buffer (cursor-acp--session-chat-buffer sess)
+      (let ((end (point-max)))
+        (cursor-acp--hide-markup-region (point-min) end)))
+    (cursor-acp--chat-insert sess "\n" t)
+    (cursor-acp--chat-insert sess (propertize "❓ Question" 'face '(bold font-lock-keyword-face)) t)
+    (when (and (stringp title) (not (string-empty-p (string-trim title))))
+      (cursor-acp--chat-insert sess (concat " " (string-trim title)) t))
+    (cursor-acp--chat-insert sess "\n" t)
+    (dolist (q questions)
+      (when (hash-table-p q)
+        (let* ((qprompt (cursor-acp--ht-get q "prompt"))
+               (opts (cursor-acp--normalize-items (cursor-acp--ht-get q "options"))))
+          (when (and (stringp qprompt) (not (string-empty-p (string-trim qprompt))))
+            (cursor-acp--chat-insert sess (concat (string-trim qprompt) "\n") t))
+          (dolist (o opts)
+            (when (hash-table-p o)
+              (let* ((oid (cursor-acp--ht-get o "id"))
+                     (lbl (cursor-acp--ht-get o "label"))
+                     (id0 (string-trim (format "%s" (or oid ""))))
+                     (lb0 (string-trim (format "%s" (or lbl "")))))
+                (cursor-acp--chat-insert sess (format "%s - %s\n" id0 lb0) t)))))))))
+
+(defun cursor-acp--ask-question-select-option-ids (prompt-prefix options allow-multiple)
+  (let ((opts (cl-remove-if-not #'hash-table-p options)))
+    (when (null opts)
+      (user-error "Question has no options"))
+    (if allow-multiple
+        (let* ((id-set (mapcar (lambda (o) (string-trim (format "%s" (cursor-acp--ht-get o "id")))) opts))
+               (s (read-string (format "%s (comma-separated option ids): " prompt-prefix)))
+               (parts (split-string s "[,;[:space:]]+" t))
+               (bad (cl-remove-if (lambda (p) (cl-member p id-set :test #'string-equal)) parts)))
+          (when bad
+            (user-error "Unknown option id(s): %s" (string-join bad ", ")))
+          (when (null parts)
+            (user-error "Select at least one option"))
+          (cl-delete-duplicates parts :test #'string-equal))
+      (let ((n (length opts)))
+        (if (> n 9)
+            (let* ((ids (mapcar (lambda (o) (string-trim (format "%s" (cursor-acp--ht-get o "id")))) opts))
+                   (chosen (completing-read (format "%s option id: " prompt-prefix) ids nil t)))
+              (unless (cl-member chosen ids :test #'string-equal)
+                (user-error "Invalid option id"))
+              (list chosen))
+          (let* ((pairs
+                  (cl-loop for o in opts
+                           for i from 1
+                           collect
+                           (let ((oid (cursor-acp--ht-get o "id")))
+                             (list i (string-trim (format "%s" oid)) oid))))
+                 (prompt
+                  (format "%s%s: "
+                          prompt-prefix
+                          (mapconcat (lambda (p) (format "[%d] %s" (nth 0 p) (nth 1 p))) pairs "  ")))
+                 (choices (mapcar (lambda (p) (+ ?0 (nth 0 p))) pairs))
+                 (ch (read-char-choice prompt choices))
+                 (idx (- ch ?0))
+                 (sel (cl-find-if (lambda (p) (= (nth 0 p) idx)) pairs)))
+            (list (string-trim (format "%s" (nth 2 sel))))))))))
+
+(defun cursor-acp--prompt-ask-question-decision (sess params)
+  (let* ((questions (cursor-acp--normalize-items
+                     (and (hash-table-p params) (cursor-acp--ht-get params "questions"))))
+         (qhts (cl-remove-if-not #'hash-table-p questions))
+         (rows '()))
+    (cursor-acp--render-ask-question sess params)
+    (when (null qhts)
+      (user-error "Ask question request did not include questions"))
+    (dolist (q qhts)
+      (let* ((qid (cursor-acp--ht-get q "id"))
+             (qid0 (string-trim (format "%s" (or qid ""))))
+             (opts (cursor-acp--normalize-items (cursor-acp--ht-get q "options")))
+             (multi (and (cursor-acp--ht-get q "allowMultiple") t))
+             (picked (cursor-acp--ask-question-select-option-ids
+                      (format "ACP question [%s] " qid0) opts multi)))
+        (push `((questionId . ,qid0) (selectedOptionIds . ,(vconcat picked))) rows)))
+    (let ((answers (vconcat (nreverse rows))))
+      (cursor-acp--chat-insert
+       sess
+       (propertize "✅ [question answered]\n" 'face '(bold success))
+       t)
+      `((outcome . "answered") (answers . ,answers)))))
 
 (defun cursor-acp--truncate-string (s maxlen)
   (let ((s0 (if (stringp s) s (format "%s" (or s ""))))
@@ -638,11 +811,13 @@
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
+    (define-key map (kbd "C-c C-b") #'cursor-acp-reprompt-ask-question)
     (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
     (define-key map (kbd "C-c C-v") #'cursor-acp-review)
     (define-key map (kbd "C-c C-w") #'cursor-acp-switch-session)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
-    (define-key map (kbd "C-c C-i") #'cursor-acp-show-info)
+    (define-key map (kbd "C-c C-i") #'cursor-acp-cycle-mode)
+    (define-key map (kbd "C-c C-d") #'cursor-acp-show-info)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
     (define-key map (kbd "C-c C-m") #'cursor-acp-switch-mode)
     (define-key map (kbd "C-c C-M") #'cursor-acp-switch-model)
@@ -666,9 +841,12 @@
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
+    (define-key map (kbd "C-c C-b") #'cursor-acp-reprompt-ask-question)
     (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
     (define-key map (kbd "C-c C-v") #'cursor-acp-review)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
+    (define-key map (kbd "C-c C-i") #'cursor-acp-cycle-mode)
+    (define-key map (kbd "C-c C-d") #'cursor-acp-show-info)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
     (define-key map (kbd "C-c C-m") #'cursor-acp-switch-mode)
     (define-key map (kbd "C-c C-M") #'cursor-acp-switch-model)
@@ -711,9 +889,11 @@
     (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
     (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
     (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
+    (define-key map (kbd "C-c C-b") #'cursor-acp-reprompt-ask-question)
     (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
     (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
-    (define-key map (kbd "C-c C-i") #'cursor-acp-show-info)
+    (define-key map (kbd "C-c C-i") #'cursor-acp-cycle-mode)
+    (define-key map (kbd "C-c C-d") #'cursor-acp-show-info)
     (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
     (define-key map (kbd "C-c C-m") #'cursor-acp-switch-mode)
     (define-key map (kbd "C-c C-M") #'cursor-acp-switch-model)
@@ -734,7 +914,7 @@
     (read-only-mode -1))
   (setq-local buffer-read-only nil)
   (let ((sess (cursor-acp--ensure-session)))
-    (setq-local header-line-format (cursor-acp--status-line sess))
+    (setq-local header-line-format (cursor-acp--chat-header-line sess))
     (when (zerop (buffer-size))
       (let ((inhibit-read-only t))
         (insert (propertize "Cursor ACP Chat\n" 'face 'cursor-acp-header-face))
@@ -746,10 +926,12 @@
       (kbd "RET") #'cursor-acp-send
       (kbd "C-j") #'newline)
     (evil-define-key '(normal motion) cursor-acp-chat-mode-map
-      (kbd "C-c C-i") #'cursor-acp-show-info
+      (kbd "C-c C-i") #'cursor-acp-cycle-mode
+      (kbd "C-c C-d") #'cursor-acp-show-info
       (kbd "C-c C-p") #'cursor-acp-focus-input)
     (evil-define-key '(insert) cursor-acp-chat-mode-map
-      (kbd "C-c C-i") #'cursor-acp-show-info
+      (kbd "C-c C-i") #'cursor-acp-cycle-mode
+      (kbd "C-c C-d") #'cursor-acp-show-info
       (kbd "C-c C-p") #'cursor-acp-focus-input)))
 
 (defun cursor-acp--path-has-hidden-component-p (path)
@@ -837,7 +1019,7 @@
       (set-window-buffer chat-win chat))
     (with-current-buffer chat
       (cursor-acp-chat-mode)
-      (setq-local header-line-format (cursor-acp--status-line sess)))
+      (setq-local header-line-format (cursor-acp--chat-header-line sess)))
     (with-current-buffer input
       (cursor-acp-input-mode))
     (cursor-acp--input-focus sess)))

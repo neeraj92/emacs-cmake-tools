@@ -1,6 +1,6 @@
 #+title: ACP Protocol Coverage (cursor-acp)
 #+author: Cursor ACP audit
-#+date: 2026-04-29
+#+date: 2026-04-30
 
 * Scope
 This report compares [[https://agentclientprotocol.com/protocol/overview][ACP protocol overview]] against the current implementation in the split Cursor ACP modules.
@@ -24,29 +24,28 @@ This report compares [[https://agentclientprotocol.com/protocol/overview][ACP pr
 | Prompt Turn              | turn end on prompt response (=stopReason=)     | Done                     | Detects terminal stop reasons (including =end_turn= and cancellation variants) and finalizes assistant block/spinner.    | Optional: add explicit UX messaging for non-standard stop reasons (e.g. length/tool limits).                                  |
 | Prompt Turn              | cancellation via =session/cancel=              | Done                     | Implemented via =cursor-acp-cancel-turn= (key: =C-c C-x=), sends protocol cancel notification and keeps process alive.   | Optional: add in-flight turn id tracking if future ACP servers require turn-scoped cancellation payloads.                      |
 | Agent Optional           | =session/set_mode=                             | Partial                  | Supports mode switch via =session/set_config_option= when advertised; fallback uses =session/set_mode=.                  | Normalize to protocol-preferred path per negotiated capabilities; explicit compatibility matrix.                              |
-| Client Baseline Method   | permission request handling (agent->client)    | Done                     | Handles =session/request_permission= with minibuffer choice; logs request/reason and selection in chat; header shows =awaiting-permission=. | Optional: support allow/deny “always” persistence policies; richer details view; queue multiple concurrent requests.          |
-| Client Optional Method   | fs.readTextFile                                | Not Implemented          | Client advertises =readTextFile=false=. No method implementation.                                                        | Advertise true when implemented; add absolute-path validation, file read RPC handler, error mapping.                          |
-| Client Optional Method   | fs.writeTextFile                               | Not Implemented          | Client advertises =writeTextFile=false=. No method implementation.                                                       | Advertise true when implemented; add safe write policy, backup/atomic writes, path checks, error mapping.                     |
+| Client Baseline Method   | permission request handling (agent->client)    | Done                     | Handles =session/request_permission= request: renders request in chat, prompts in minibuffer, responds with =outcome:selected= + chosen =optionId=; header shows =awaiting-permission=. | Optional: allow/deny “always” persistence policies; richer details view; queue multiple concurrent requests.                  |
+| Client Optional Method   | fs.readTextFile                                | Done                     | Implements agent->client =fs/read_text_file= in =cursor-acp--handle-message= via =cursor-acp--fs-read-text-file=; enforces absolute path, workspace-root containment, and supports 1-based =line= + =limit= (line count). Client advertises =clientCapabilities.fs.readTextFile=true=. | Optional: support non-workspace read policy (explicit allowlist), binary files, and richer error UI states.                   |
+| Client Optional Method   | fs.writeTextFile                               | Done                     | Implements agent->client =fs/write_text_file= in =cursor-acp--handle-message= via =cursor-acp--fs-write-text-file=; enforces absolute path + workspace-root containment; creates parent dirs; writes file; emits a chat note and records a per-project “seed” for later ediff review. Client advertises =clientCapabilities.fs.writeTextFile=true=. | Optional: atomic writes/backups; configurable write policy; richer error UI states.                                           |
 | Client Optional Method   | terminal.create / read / wait / kill / release | Not Implemented          | Client advertises =terminal=false=. No terminal RPC handlers.                                                            | Implement terminal capability surface and lifecycle API handlers, then advertise capability true.                             |
 | Notifications/Updates    | advertised commands updates                    | Done                     | Parses command updates from =session/update= and exposes in UI.                                                          | Optional: diff/highlight added/removed commands.                                                                              |
 | Notifications/Updates    | mode change updates                            | Done                     | Parses mode change fields in =session/update=.                                                                           | Optional: explicit mode-change event logging in chat stream.                                                                  |
-| Notifications/Updates    | plans/tool-call updates                        | Partial                  | Renders =tool_call_update= =rawOutput= into chat as per-key fenced blocks (skips empty values).                          | Add full tool call lifecycle rendering (=tool_call= create events, status transitions, content/diff/terminal payloads, locations). |
-| Argument Requirements    | absolute file paths, 1-based lines             | Not Applicable / Pending | No file/line RPC methods currently implemented in client.                                                                | Enforce when fs/edit methods are added.                                                                                       |
+| Notifications/Updates    | plans/tool-call updates                        | Partial                  | Tracks =tool_call= metadata (=toolCallId=, title/kind/status) and on =tool_call_update= completion renders raw output; also detects embedded =diff= content blocks (path/old/new) and renders unified diff previews + saves per-project “seed” files for review. | Add full tool-call lifecycle rendering beyond “completed” (status transitions, incremental updates, richer content rendering). |
+| Argument Requirements    | absolute file paths, 1-based lines             | Partial                  | Enforced for filesystem methods: fs requires absolute paths and rejects paths outside workspace; fs line reads accept 1-based =line= and =limit= (line count). | Extend enforcement to any future file/line RPC surfaces (edits/patches), plus consistent error reporting.                     |
 | Error Handling           | JSON-RPC error object handling                 | Partial                  | Request path stores =error= and raises Elisp errors; parse failures logged.                                              | Add structured user-facing error states per method/notification class; preserve error codes/messages in UI.                   |
 | Extensibility            | custom methods (= _*=), =_meta= fields         | Not Implemented          | No explicit custom method registration/handling.                                                                         | Add generic dispatch for custom methods and pass-through support for =_meta= in requests/responses.                           |
 
 * High-Level Completion
 - Core baseline agent-side flow (initialize/auth/new/prompt/update/end-turn): largely implemented.
-- Biggest missing protocol surface is transcript replay completeness for multi-session (=session/load=), plus client capabilities (file system, terminal).
-- Practical next milestone: finish =session/load= history rendering (replay update taxonomy), then move to fs/terminal and fuller tool-call rendering.
+- Biggest missing protocol surface is transcript replay completeness for multi-session (=session/load=), terminal capability surface, and fuller tool-call lifecycle rendering.
+- Practical next milestone: finish =session/load= history rendering (replay update taxonomy), then move to terminal and fuller tool-call lifecycle rendering.
 
 * Suggested Implementation Order
 1. Finish =session/load= transcript replay: implement rendering for replay update types (at minimum =user_message_chunk=, plus any assistant chunk variants the agent emits during replay).
 2. Improve session picker UX: paging for =session/list= (=nextCursor=), and display more metadata (cwd, updatedAt, tags).
 3. Optional: add =session/close= if agent supports it (and a cleanup command).
-4. File-system methods (read/write) with strict absolute path checks.
-5. Terminal capability methods.
-6. Richer =session/update= support for tool calls and plans (full lifecycle, not only =rawOutput=).
+4. Terminal capability methods.
+5. Richer =session/update= support for tool calls and plans (full lifecycle, not only completion rendering).
 
 * UI Notes (current state)
 - Chat buffer major mode: =cursor-acp-chat-mode= derived from =markdown-mode= (when installed).
@@ -57,3 +56,4 @@ This report compares [[https://agentclientprotocol.com/protocol/overview][ACP pr
   - If the prompt is cancelled, the request stays pending and can be retried via =C-c C-a= (=cursor-acp-reprompt-permission=).
 - Tool call UX:
   - When =tool_call_update.rawOutput= is present, it is printed in fenced =text= blocks, split per key (e.g. stdout/stderr).
+  - If a tool payload contains embedded =diff= blocks (path/old/new), a unified diff preview is rendered and a per-project “seed” file is stored for later =ediff= review.

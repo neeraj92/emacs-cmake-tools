@@ -69,12 +69,27 @@
   available-commands
   ui-expanded
   tool-calls
+  plan-entries
+  plan-buffer
+  awaiting-create-plan
+  create-plan-request-id
+  create-plan-request-params
+  create-plan-path
   busy
   spinner-idx
   spinner-timer
   awaiting-permission
   permission-request-id
+  permission-request-ids
+  permission-tool-call-id
   permission-request-params
+  permission-response-cache
+  awaiting-ask-question
+  ask-question-request-id
+  ask-question-request-ids
+  ask-question-tool-call-id
+  ask-question-request-params
+  ask-question-response-cache
   assistant-frag
   draft-input
   main-buffer
@@ -105,9 +120,11 @@ This avoids inserting one token/word at a time when the server streams tiny chun
   :group 'cursor-acp)
 
 (defcustom cursor-acp-markdown-hide-markup t
-  "If non-nil, hide Markdown markup characters in chat buffer.
+  "If non-nil, hide Markdown markup in chat and in plan/todo views.
 
-This uses `markdown-mode' markup-hiding overlays when available."
+Chat uses `cursor-acp--hide-markup-region' overlays. Plan file and side
+todo buffers use `markdown-mode' / `gfm-mode' and `markdown-hide-markup'
+when the installed markdown-mode supports it."
   :type 'boolean
   :group 'cursor-acp)
 
@@ -129,6 +146,19 @@ Seeds are stored per project (workspace root) under this directory."
   :type 'directory
   :group 'cursor-acp)
 
+(defcustom cursor-acp-terminal-root-dir
+  (let ((xdg (getenv "XDG_CONFIG_HOME")))
+    (expand-file-name
+     "emacs-cursor-acp/terminals/"
+     (if (and (stringp xdg) (not (string-empty-p (string-trim xdg))))
+         (file-name-as-directory (expand-file-name xdg))
+       (expand-file-name "~/.config/"))))
+  "Root directory for Cursor ACP terminal output logs.
+
+Terminal logs are stored per project (workspace root) under this directory."
+  :type 'directory
+  :group 'cursor-acp)
+
 (defun cursor-acp--review--sanitize (s)
   (replace-regexp-in-string "[^A-Za-z0-9_.-]" "_" (or s "")))
 
@@ -136,6 +166,16 @@ Seeds are stored per project (workspace root) under this directory."
   (let* ((root (cursor-acp--workspace-root sess))
          (key (cursor-acp--review--sanitize (directory-file-name (expand-file-name root)))))
     (file-name-as-directory (expand-file-name key cursor-acp-review-root-dir))))
+
+(defun cursor-acp--terminal-project-dir (sess)
+  (let* ((root (cursor-acp--workspace-root sess))
+         (key (cursor-acp--review--sanitize (directory-file-name (expand-file-name root)))))
+    (file-name-as-directory (expand-file-name key cursor-acp-terminal-root-dir))))
+
+(defun cursor-acp--terminal-log-file (sess terminal-id)
+  (let* ((proj (cursor-acp--terminal-project-dir sess))
+         (name (cursor-acp--review--sanitize (or terminal-id "term_unknown"))))
+    (expand-file-name (format "%s.log" name) proj)))
 
 (defun cursor-acp--review-seed-path (sess abs-path)
   (let* ((root (cursor-acp--workspace-root sess))
@@ -247,12 +287,27 @@ Seeds are stored per project (workspace root) under this directory."
                   :available-commands nil
                   :ui-expanded (make-hash-table :test #'equal)
                   :tool-calls (make-hash-table :test #'equal)
+                  :plan-entries nil
+                  :plan-buffer nil
+                  :awaiting-create-plan nil
+                  :create-plan-request-id nil
+                  :create-plan-request-params nil
+                  :create-plan-path nil
                   :busy nil
                   :spinner-idx 0
                   :spinner-timer nil
                   :awaiting-permission nil
                   :permission-request-id nil
+                  :permission-request-ids nil
+                  :permission-tool-call-id nil
                   :permission-request-params nil
+                  :permission-response-cache (make-hash-table :test #'equal)
+                  :awaiting-ask-question nil
+                  :ask-question-request-id nil
+                  :ask-question-request-ids nil
+                  :ask-question-tool-call-id nil
+                  :ask-question-request-params nil
+                  :ask-question-response-cache (make-hash-table :test #'equal)
                   :assistant-frag ""
                   :draft-input ""
                   :main-buffer nil
@@ -280,7 +335,7 @@ Seeds are stored per project (workspace root) under this directory."
   (cursor-acp--session-by-id cursor-acp--active-session-id))
 
 (defun cursor-acp--session-for-buffer (buf)
-  "Return the session that owns BUF (chat/input/info/log), else nil."
+  "Return the session that owns BUF (chat/input/plan/info/log), else nil."
   (when (and (buffer-live-p buf) (hash-table-p cursor-acp--sessions))
     (catch 'found
       (maphash
@@ -288,6 +343,7 @@ Seeds are stored per project (workspace root) under this directory."
          (when (and (cursor-acp--valid-session-p sess)
                     (memq buf (list (cursor-acp--session-chat-buffer sess)
                                     (cursor-acp--session-input-buffer sess)
+                                    (cursor-acp--session-plan-buffer sess)
                                     (cursor-acp--session-info-buffer sess)
                                     (cursor-acp--session-log-buffer sess))))
            (throw 'found sess)))
@@ -317,6 +373,7 @@ Seeds are stored per project (workspace root) under this directory."
          (ignore-errors (cancel-timer tmr)))
        (dolist (buf (list (ignore-errors (cursor-acp--session-chat-buffer sess))
                           (ignore-errors (cursor-acp--session-input-buffer sess))
+                          (ignore-errors (cursor-acp--session-plan-buffer sess))
                           (ignore-errors (cursor-acp--session-info-buffer sess))
                           (ignore-errors (cursor-acp--session-log-buffer sess))))
          (when (buffer-live-p buf)
@@ -347,6 +404,7 @@ Seeds are stored per project (workspace root) under this directory."
 (defun cursor-acp--ensure-session-buffers (sess)
   (let ((chat (cursor-acp--session-chat-buffer sess))
         (input (cursor-acp--session-input-buffer sess))
+        (plan (cursor-acp--session-plan-buffer sess))
         (info (cursor-acp--session-info-buffer sess))
         (log (cursor-acp--session-log-buffer sess)))
     (unless (buffer-live-p chat)
@@ -355,6 +413,8 @@ Seeds are stored per project (workspace root) under this directory."
     (unless (buffer-live-p input)
       (setf (cursor-acp--session-input-buffer sess)
             (cursor-acp--ensure-unique-buffer (cursor-acp--input-buffer-name sess))))
+    (when (and plan (not (buffer-live-p plan)))
+      (setf (cursor-acp--session-plan-buffer sess) nil))
     (unless (buffer-live-p info)
       (setf (cursor-acp--session-info-buffer sess)
             (cursor-acp--ensure-buffer cursor-acp--info-buffer-name)))
@@ -388,12 +448,27 @@ Seeds are stored per project (workspace root) under this directory."
                   :available-commands nil
                   :ui-expanded (make-hash-table :test #'equal)
                   :tool-calls (make-hash-table :test #'equal)
+                  :plan-entries nil
+                  :plan-buffer nil
+                  :awaiting-create-plan nil
+                  :create-plan-request-id nil
+                  :create-plan-request-params nil
+                  :create-plan-path nil
                   :busy nil
                   :spinner-idx 0
                   :spinner-timer nil
                   :awaiting-permission nil
                   :permission-request-id nil
+                  :permission-request-ids nil
+                  :permission-tool-call-id nil
                   :permission-request-params nil
+                  :permission-response-cache (make-hash-table :test #'equal)
+                  :awaiting-ask-question nil
+                  :ask-question-request-id nil
+                  :ask-question-request-ids nil
+                  :ask-question-tool-call-id nil
+                  :ask-question-request-params nil
+                  :ask-question-response-cache (make-hash-table :test #'equal)
                   :assistant-frag ""
                   :draft-input ""
                   :main-buffer nil
@@ -416,6 +491,23 @@ Seeds are stored per project (workspace root) under this directory."
                   (cursor-acp--session-cwd sess))))
     (file-name-as-directory (expand-file-name (or cwd default-directory)))))
 
+(defun cursor-acp--plans-dir (sess)
+  (expand-file-name ".cursor/plans/" (cursor-acp--workspace-root sess)))
+
+(defun cursor-acp--sanitize-plan-name (name)
+  (let* ((s (string-trim (or name "")))
+         (s (if (string-empty-p s) "plan" s))
+         (s (downcase s))
+         (s (replace-regexp-in-string "[^a-z0-9._-]+" "_" s))
+         (s (replace-regexp-in-string "_+" "_" s))
+         (s (replace-regexp-in-string "\\`[_\\. -]+" "" s))
+         (s (replace-regexp-in-string "[_\\. -]+\\'" "" s)))
+    (if (string-empty-p s) "plan" s)))
+
+(defun cursor-acp--plan-path (sess name)
+  (expand-file-name (format "%s.md" (cursor-acp--sanitize-plan-name name))
+                    (cursor-acp--plans-dir sess)))
+
 (defun cursor-acp--json-encode (obj)
   (json-serialize obj :null-object :null :false-object :json-false))
 
@@ -437,6 +529,37 @@ Seeds are stored per project (workspace root) under this directory."
            (insert (if (stringp payload) payload (format "%S" payload)))))
         (insert "\n\n")))))
 
+(defun cursor-acp--chat-header-line (sess)
+  (let* ((conn (cursor-acp--ensure-conn))
+         (proc (cursor-acp--conn-process conn))
+         (alive (and proc (process-live-p proc)))
+         (busy (and alive (cursor-acp--session-busy sess)))
+         (sp (when busy
+               (let* ((idx (or (cursor-acp--session-spinner-idx sess) 0))
+                      (n (length cursor-acp--spinner-frames)))
+                 (aref cursor-acp--spinner-frames (mod idx n)))))
+         (title (cursor-acp--session-buffer-title sess))
+         (mode (or (cursor-acp--session-current-mode sess) "-"))
+         (model0 (cursor-acp--session-current-model sess))
+         (model1 (if (stringp model0) (string-trim model0) ""))
+         (model (if (or (not (stringp model0))
+                        (string-empty-p model1)
+                        (string-equal model1 "-"))
+                    "Auto"
+                  model1)))
+    (concat
+     (if alive "🟢" "🔴")
+     (when sp (format " %s" sp))
+     "  "
+     (propertize (format "%s  %s  %s" title mode model) 'face 'cursor-acp-header-face))))
+
+(defun cursor-acp--chat-refresh-header (sess)
+  (when (cursor-acp--valid-session-p sess)
+    (when-let ((buf (cursor-acp--session-chat-buffer sess)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (setq-local header-line-format (cursor-acp--chat-header-line sess)))))))
+
 (defun cursor-acp--status-line (sess)
   (let* ((conn (cursor-acp--ensure-conn))
          (proc (cursor-acp--conn-process conn))
@@ -446,6 +569,7 @@ Seeds are stored per project (workspace root) under this directory."
          (model (or (cursor-acp--session-current-model sess) "-"))
          (busy (and alive (cursor-acp--session-busy sess)))
          (awaiting (and alive (cursor-acp--session-awaiting-permission sess)))
+         (awaiting-q (and alive (cursor-acp--session-awaiting-ask-question sess)))
          (sp (when busy
                (let* ((idx (or (cursor-acp--session-spinner-idx sess) 0))
                       (n (length cursor-acp--spinner-frames)))
@@ -457,16 +581,13 @@ Seeds are stored per project (workspace root) under this directory."
                  'face (if alive 'cursor-acp-status-ok-face 'cursor-acp-status-bad-face))
      (when sp (format " %s" sp))
      (when awaiting " awaiting-permission")
+     (when awaiting-q " awaiting-ask-question")
      (when sid (format "  sessionId=%s" sid))
      (format "  title=%s" (cursor-acp--session-buffer-title sess))
      (format "  mode=%s  model=%s" mode model))))
 
 (defun cursor-acp--refresh-header (sess)
-  (when (cursor-acp--valid-session-p sess)
-    (when-let ((buf (cursor-acp--session-chat-buffer sess)))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (setq-local header-line-format (cursor-acp--status-line sess)))))))
+  (cursor-acp--chat-refresh-header sess))
 
 (defun cursor-acp--spinner-start (sess)
   (when-let ((tmr (cursor-acp--session-spinner-timer sess)))
@@ -499,6 +620,10 @@ Seeds are stored per project (workspace root) under this directory."
   (setf (cursor-acp--session-awaiting-permission sess) (and awaiting t))
   (cursor-acp--refresh-header sess))
 
+(defun cursor-acp--set-awaiting-ask-question (sess awaiting)
+  (setf (cursor-acp--session-awaiting-ask-question sess) (and awaiting t))
+  (cursor-acp--refresh-header sess))
+
 (defun cursor-acp--ht-get (ht key)
   (when (hash-table-p ht) (gethash key ht nil)))
 
@@ -515,6 +640,51 @@ Seeds are stored per project (workspace root) under this directory."
    ((vectorp items) (append items nil))
    ((listp items) items)
    (t nil)))
+
+(defun cursor-acp--plan-todo-id-string (entry)
+  (when (hash-table-p entry)
+    (let ((id (cursor-acp--ht-get entry "id")))
+      (when (stringp id)
+        (let ((s (string-trim id)))
+          (unless (string-empty-p s) s))))))
+
+(defun cursor-acp--merge-plan-todo-entries (existing incoming mergep)
+  (let ((inc (cursor-acp--normalize-items incoming)))
+    (if (not mergep)
+        inc
+      (let* ((ex (or (cursor-acp--normalize-items existing) '()))
+             (by-id (make-hash-table :test 'equal))
+             out)
+        (dolist (item inc)
+          (when-let ((id (cursor-acp--plan-todo-id-string item)))
+            (puthash id item by-id)))
+        (dolist (e ex)
+          (let* ((id (cursor-acp--plan-todo-id-string e))
+                 (rep (and id (gethash id by-id))))
+            (if rep
+                (progn (remhash id by-id) (push rep out))
+              (push e out))))
+        (setq out (nreverse out))
+        (dolist (item inc)
+          (when-let ((id (cursor-acp--plan-todo-id-string item)))
+            (when (gethash id by-id)
+              (setq out (append out (list (gethash id by-id))))
+              (remhash id by-id))))
+        (dolist (item inc)
+          (unless (cursor-acp--plan-todo-id-string item)
+            (setq out (append out (list item)))))
+        out))))
+
+(defun cursor-acp--plan-update-todos-merge-p (params)
+  (unless (hash-table-p params)
+    (cl-return-from cursor-acp--plan-update-todos-merge-p t))
+  (let ((m (cursor-acp--ht-get params "merge")))
+    (cond
+     ((null m) t)
+     ((eq m json-false) nil)
+     ((stringp m)
+      (not (member (downcase (string-trim m)) '("false" "0" "no"))))
+     (t (and m t)))))
 
 (defun cursor-acp--cache-config-options (sess opts)
   (when-let ((os (cursor-acp--normalize-items opts)))

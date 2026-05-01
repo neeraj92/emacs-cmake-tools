@@ -88,6 +88,7 @@
     (unless (cursor-acp--session-busy sess)
       (user-error "No active turn to cancel"))
     (cursor-acp--cancel-pending-permission sess)
+    (cursor-acp--cancel-pending-ask-question sess)
     (cursor-acp--rpc-notify sess "session/cancel" `((sessionId . ,sid)))
     (cursor-acp--assistant-flush-frag sess)
     (cursor-acp--chat-insert sess "\n[cancel requested]\n" t)
@@ -101,6 +102,22 @@
        (cursor-acp--active-session)
        (cursor-acp--ensure-session))))
 
+(defun cursor-acp-reprompt-create-plan ()
+  "Re-open prompt for a pending `cursor/create_plan' request."
+  (interactive)
+  (cursor-acp--reprompt-pending-create-plan
+   (or (cursor-acp--session-for-buffer (current-buffer))
+       (cursor-acp--active-session)
+       (cursor-acp--ensure-session))))
+
+(defun cursor-acp-reprompt-ask-question ()
+  "Re-open prompt for a pending `cursor/ask_question' request."
+  (interactive)
+  (cursor-acp--reprompt-pending-ask-question
+   (or (cursor-acp--session-for-buffer (current-buffer))
+       (cursor-acp--active-session)
+       (cursor-acp--ensure-session))))
+
 (defun cursor-acp-start ()
   "Start ACP and create a session."
   (interactive)
@@ -110,13 +127,11 @@
         (progn
           (cursor-acp--handshake sess)
           (let ((s (or (cursor-acp--active-session) sess)))
-            (with-current-buffer (cursor-acp--session-chat-buffer s)
-              (setq-local header-line-format (cursor-acp--status-line s)))
+            (cursor-acp--chat-refresh-header s)
             (cursor-acp--render-info s)))
       (error
        (cursor-acp--log sess "error" (format "%S" err))
-       (with-current-buffer (cursor-acp--session-chat-buffer sess)
-         (setq-local header-line-format (cursor-acp--status-line sess)))
+       (cursor-acp--chat-refresh-header sess)
        (cursor-acp--render-info sess)
        (signal (car err) (cdr err))))))
 
@@ -150,8 +165,7 @@
       (ignore-errors (delete-process proc)))
     (setf (cursor-acp--conn-process (cursor-acp--ensure-conn)) nil)
     (cursor-acp--log sess "process" "killed by user")
-    (with-current-buffer (cursor-acp--session-chat-buffer sess)
-      (setq-local header-line-format (cursor-acp--status-line sess)))
+    (cursor-acp--chat-refresh-header sess)
     (cursor-acp--render-info sess)))
 
 (defun cursor-acp-show-info ()
@@ -181,6 +195,49 @@
             (ignore-errors (delete-window w))))))
     (cursor-acp--delete-pane-windows (selected-frame))))
 
+(defun cursor-acp--mode-cycle-ids (sess opt)
+  (if opt
+      (delq nil
+            (mapcar
+             (lambda (v)
+               (when (hash-table-p v)
+                 (let ((val (cursor-acp--ht-get v "value")))
+                   (when (stringp val) val))))
+             (cursor-acp--normalize-items (cursor-acp--ht-get opt "options"))))
+    (delq nil
+          (mapcar
+           (lambda (m)
+             (when (hash-table-p m)
+               (let ((id (or (cursor-acp--ht-get m "id") (cursor-acp--ht-get m "name"))))
+                 (when (stringp id) id))))
+           (or (cursor-acp--session-available-modes sess)
+               (cursor-acp--default-modes))))))
+
+(defun cursor-acp-cycle-mode ()
+  "Set ACP session mode to the next entry in the advertised order."
+  (interactive)
+  (let* ((sess (cursor-acp--ensure-session))
+         (opt (or (cursor-acp--config-option-by-category sess "mode")
+                  (cursor-acp--config-option-by-id sess "mode")))
+         (ids (cursor-acp--mode-cycle-ids sess opt))
+         (n (length ids)))
+    (cond
+     ((zerop n) (user-error "No ACP modes available to cycle"))
+     ((= n 1) (message "ACP mode: only %s" (car ids)))
+     (t
+      (let* ((cur (cursor-acp--session-current-mode sess))
+             (idx (when (stringp cur) (cl-position cur ids :test #'string-equal)))
+             (next (nth (mod (1+ (or idx -1)) n) ids)))
+        (cond
+         (opt (cursor-acp--set-config-option sess "mode" next))
+         (t
+          (let ((sid (cursor-acp--ensure-connected-session sess)))
+            (cursor-acp--rpc-call sess "session/set_mode" `((sessionId . ,sid) (modeId . ,next)))
+            (setf (cursor-acp--session-current-mode sess) next)
+            (cursor-acp--chat-refresh-header sess)
+            (cursor-acp--render-info sess))))
+        (message "ACP mode: %s" next))))))
+
 (defun cursor-acp-switch-mode ()
   "Interactively switch ACP session mode."
   (interactive)
@@ -209,8 +266,7 @@
              (mode-id (cdr (assoc choice alist))))
         (cursor-acp--rpc-call sess "session/set_mode" `((sessionId . ,sid) (modeId . ,mode-id)))
         (setf (cursor-acp--session-current-mode sess) mode-id)
-        (with-current-buffer (cursor-acp--session-chat-buffer sess)
-          (setq-local header-line-format (cursor-acp--status-line sess)))
+        (cursor-acp--chat-refresh-header sess)
         (cursor-acp--render-info sess))))))
 
 (defun cursor-acp-switch-model ()
