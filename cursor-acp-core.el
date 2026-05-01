@@ -146,6 +146,16 @@ Seeds are stored per project (workspace root) under this directory."
   :type 'directory
   :group 'cursor-acp)
 
+(defcustom cursor-acp-review-skip-relative-prefixes
+  '(".cursor/plans")
+  "Path prefixes (relative to `cursor-acp--workspace-root') to skip for reviews.
+
+When a changed file path matches a prefix, no review seed is created and it is
+omitted from `cursor-acp-review' completion. Matching is prefix-based after
+normalizing slashes; a trailing slash on an entry is optional."
+  :type '(repeat string)
+  :group 'cursor-acp)
+
 (defcustom cursor-acp-terminal-root-dir
   (let ((xdg (getenv "XDG_CONFIG_HOME")))
     (expand-file-name
@@ -156,6 +166,20 @@ Seeds are stored per project (workspace root) under this directory."
   "Root directory for Cursor ACP terminal output logs.
 
 Terminal logs are stored per project (workspace root) under this directory."
+  :type 'directory
+  :group 'cursor-acp)
+
+(defcustom cursor-acp-session-transcript-root-dir
+  (let ((xdg (getenv "XDG_CONFIG_HOME")))
+    (expand-file-name
+     "emacs-cursor-acp/sessions/"
+     (if (and (stringp xdg) (not (string-empty-p (string-trim xdg))))
+         (file-name-as-directory (expand-file-name xdg))
+       (expand-file-name "~/.config/"))))
+  "Root directory for persisted ACP chat transcripts.
+
+Each workspace has a subdirectory; each session id has a folder with a file
+named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
   :type 'directory
   :group 'cursor-acp)
 
@@ -176,6 +200,50 @@ Terminal logs are stored per project (workspace root) under this directory."
   (let* ((proj (cursor-acp--terminal-project-dir sess))
          (name (cursor-acp--review--sanitize (or terminal-id "term_unknown"))))
     (expand-file-name (format "%s.log" name) proj)))
+
+(defun cursor-acp--session-transcript-workspace-key (sess)
+  (cursor-acp--review--sanitize
+   (directory-file-name (expand-file-name (cursor-acp--workspace-root sess)))))
+
+(defun cursor-acp--session-transcript-file (sess)
+  (let ((sid (and (cursor-acp--valid-session-p sess)
+                  (cursor-acp--session-session-id sess))))
+    (when (and (stringp sid) (not (string-empty-p sid)))
+      (let* ((root (file-name-as-directory
+                    (expand-file-name cursor-acp-session-transcript-root-dir)))
+             (wk (cursor-acp--session-transcript-workspace-key sess))
+             (dir (file-name-as-directory
+                   (expand-file-name (cursor-acp--review--sanitize sid)
+                                     (expand-file-name wk root)))))
+        (expand-file-name "transcript" dir)))))
+
+(defun cursor-acp--session-transcript-save (sess)
+  (when (and (cursor-acp--valid-session-p sess)
+             (let ((sid (cursor-acp--session-session-id sess)))
+               (and (stringp sid) (not (string-empty-p sid)))))
+    (when-let ((path (cursor-acp--session-transcript-file sess))
+               (buf (cursor-acp--session-chat-buffer sess)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (let ((text (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
+            (unless (string-empty-p text)
+              (let ((dir (file-name-directory path)))
+                (when (and (stringp dir) (not (file-directory-p dir)))
+                  (make-directory dir t))
+                (write-region text nil path nil 'quiet)))))))))
+
+(defun cursor-acp--session-transcript-load-into-chat (sess)
+  (when-let ((path (cursor-acp--session-transcript-file sess))
+             (buf (cursor-acp--session-chat-buffer sess)))
+    (when (and (file-readable-p path) (buffer-live-p buf))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (goto-char (point-min))
+          (insert-file-contents path)))
+      (with-current-buffer buf
+        (setq-local cursor-acp--assistant-open nil)
+        (setq-local cursor-acp--assistant-start nil))
+      t)))
 
 (defun cursor-acp--review-seed-path (sess abs-path)
   (let* ((root (cursor-acp--workspace-root sess))
@@ -202,6 +270,31 @@ Terminal logs are stored per project (workspace root) under this directory."
     (when (file-exists-p seed)
       (ignore-errors (delete-file seed))
       t)))
+
+(defun cursor-acp--review--normalize-rel (rel)
+  (replace-regexp-in-string "\\\\" "/" (or rel "")))
+
+(defun cursor-acp--review-skip-path-p (sess abs)
+  (when (and (cursor-acp--valid-session-p sess) (stringp abs))
+    (let* ((root (file-name-as-directory (expand-file-name (cursor-acp--workspace-root sess))))
+           (rel (cursor-acp--review--normalize-rel
+                 (file-relative-name (expand-file-name abs) root))))
+      (unless (or (string-empty-p rel) (string-prefix-p ".." rel))
+        (cl-some
+         (lambda (pat)
+           (let ((pat (string-trim (cursor-acp--review--normalize-rel (or pat "")))))
+             (unless (string-empty-p pat)
+               (let* ((pat (replace-regexp-in-string "\\`\\./+" "" pat))
+                      (base (string-trim-right pat "/")))
+                 (or (string-equal rel pat)
+                     (string-equal rel base)
+                     (string-prefix-p (concat base "/") rel))))))
+         cursor-acp-review-skip-relative-prefixes)))))
+
+(defun cursor-acp--review-clear-project-seeds (sess)
+  (let ((proj (cursor-acp--review-project-dir sess)))
+    (when (file-directory-p proj)
+      (delete-directory proj t))))
 
 (defun cursor-acp--review-seed-text (sess abs-path)
   (let ((seed (cursor-acp--review-seed-path sess abs-path)))
@@ -330,6 +423,54 @@ Terminal logs are stored per project (workspace root) under this directory."
 
 (defun cursor-acp--set-active-session-id (session-id)
   (setq cursor-acp--active-session-id session-id))
+
+(defun cursor-acp--rehome-active-session-after-removal (removed-session-id)
+  (unless (and (stringp removed-session-id)
+               (stringp cursor-acp--active-session-id)
+               (string-equal cursor-acp--active-session-id removed-session-id))
+    (cl-return-from cursor-acp--rehome-active-session-after-removal nil))
+  (let ((survivor
+         (catch 'found
+           (when (hash-table-p cursor-acp--sessions)
+             (maphash
+              (lambda (_k sess)
+                (when (and (cursor-acp--valid-session-p sess)
+                           (let ((sid (cursor-acp--session-session-id sess)))
+                             (and (stringp sid)
+                                  (not (string-empty-p sid))
+                                  (not (string-equal sid removed-session-id)))))
+                  (throw 'found (cursor-acp--session-session-id sess))))
+              cursor-acp--sessions))
+           nil)))
+    (if (stringp survivor)
+        (setq cursor-acp--active-session-id survivor)
+      (let ((boot (gethash "__bootstrap__" (cursor-acp--ensure-sessions-table) nil)))
+        (if (cursor-acp--valid-session-p boot)
+            (setq cursor-acp--active-session-id "__bootstrap__")
+          (setq cursor-acp--active-session-id nil))))))
+
+(defun cursor-acp--session-local-evict (sess)
+  (unless (and (cursor-acp--valid-session-p sess)
+               (let ((sid (cursor-acp--session-session-id sess)))
+                 (and (stringp sid) (not (string-empty-p sid)))))
+    (cl-return-from cursor-acp--session-local-evict nil))
+  (cursor-acp--session-transcript-save sess)
+  (cursor-acp--set-busy sess nil)
+  (when-let ((tmr (ignore-errors (cursor-acp--session-spinner-timer sess))))
+    (ignore-errors (cancel-timer tmr)))
+  (setf (cursor-acp--session-spinner-timer sess) nil)
+  (setf (cursor-acp--session-awaiting-create-plan sess) nil)
+  (setf (cursor-acp--session-create-plan-request-id sess) nil)
+  (setf (cursor-acp--session-create-plan-request-params sess) nil)
+  (setf (cursor-acp--session-create-plan-path sess) nil)
+  (let ((sid (cursor-acp--session-session-id sess))
+        (tab (cursor-acp--ensure-sessions-table)))
+    (dolist (buf (list (ignore-errors (cursor-acp--session-chat-buffer sess))
+                       (ignore-errors (cursor-acp--session-input-buffer sess))
+                       (ignore-errors (cursor-acp--session-plan-buffer sess))))
+      (when (buffer-live-p buf)
+        (ignore-errors (kill-buffer buf))))
+    (remhash sid tab)))
 
 (defun cursor-acp--active-session ()
   (cursor-acp--session-by-id cursor-acp--active-session-id))

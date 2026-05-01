@@ -434,7 +434,8 @@
       (cursor-acp--hide-markup-region (marker-position cursor-acp--assistant-start) (point-max))))
   (with-current-buffer (cursor-acp--session-chat-buffer sess)
     (setq-local cursor-acp--assistant-open nil))
-  (cursor-acp--chat-insert sess "\n\n" t))
+  (cursor-acp--chat-insert sess "\n\n" t)
+  (cursor-acp--session-transcript-save sess))
 
 (defun cursor-acp--assistant-flush-frag (sess)
   "Flush any buffered assistant text without closing the assistant block."
@@ -528,85 +529,141 @@
        t)
       `((outcome . "selected") (optionId . ,selected)))))
 
-(defun cursor-acp--render-ask-question (sess params)
-  (let* ((title (and (hash-table-p params) (cursor-acp--ht-get params "title")))
-         (questions (cursor-acp--normalize-items
-                     (and (hash-table-p params) (cursor-acp--ht-get params "questions")))))
-    (with-current-buffer (cursor-acp--session-chat-buffer sess)
-      (let ((end (point-max)))
-        (cursor-acp--hide-markup-region (point-min) end)))
-    (cursor-acp--chat-insert sess "\n" t)
-    (cursor-acp--chat-insert sess (propertize "❓ Question" 'face '(bold font-lock-keyword-face)) t)
-    (when (and (stringp title) (not (string-empty-p (string-trim title))))
-      (cursor-acp--chat-insert sess (concat " " (string-trim title)) t))
-    (cursor-acp--chat-insert sess "\n" t)
-    (dolist (q questions)
-      (when (hash-table-p q)
-        (let* ((qprompt (cursor-acp--ht-get q "prompt"))
-               (opts (cursor-acp--normalize-items (cursor-acp--ht-get q "options"))))
-          (when (and (stringp qprompt) (not (string-empty-p (string-trim qprompt))))
-            (cursor-acp--chat-insert sess (concat (string-trim qprompt) "\n") t))
-          (dolist (o opts)
-            (when (hash-table-p o)
-              (let* ((oid (cursor-acp--ht-get o "id"))
-                     (lbl (cursor-acp--ht-get o "label"))
-                     (id0 (string-trim (format "%s" (or oid ""))))
-                     (lb0 (string-trim (format "%s" (or lbl "")))))
-                (cursor-acp--chat-insert sess (format "%s - %s\n" id0 lb0) t)))))))))
+(defun cursor-acp--render-ask-question-title (sess params &optional skip-banner)
+  (with-current-buffer (cursor-acp--session-chat-buffer sess)
+    (let ((end (point-max)))
+      (cursor-acp--hide-markup-region (point-min) end)))
+  (unless skip-banner
+    (let ((title (and (hash-table-p params) (cursor-acp--ht-get params "title"))))
+      (cursor-acp--chat-insert sess "\n" t)
+      (cursor-acp--chat-insert sess (propertize "❓ Question" 'face '(bold font-lock-keyword-face)) t)
+      (when (and (stringp title) (not (string-empty-p (string-trim title))))
+        (cursor-acp--chat-insert sess (concat " " (string-trim title)) t))
+      (cursor-acp--chat-insert sess "\n" t))))
 
-(defun cursor-acp--ask-question-select-option-ids (prompt-prefix options allow-multiple)
-  (let ((opts (cl-remove-if-not #'hash-table-p options)))
-    (when (null opts)
+(defun cursor-acp--render-ask-question-question (sess q n total)
+  (let* ((opts (cl-remove-if-not
+                #'hash-table-p
+                (cursor-acp--normalize-items (cursor-acp--ht-get q "options"))))
+         (pairs
+          (cl-loop for o in opts
+                   for i from 1
+                   for oid = (cursor-acp--ht-get o "id")
+                   for lbl = (cursor-acp--ht-get o "label")
+                   for id0 = (string-trim (format "%s" (or oid "")))
+                   for lb0 = (string-trim (format "%s" (or lbl id0 "")))
+                   collect (list i lb0 id0))))
+    (when (null pairs)
       (user-error "Question has no options"))
+    (let ((beg (with-current-buffer (cursor-acp--session-chat-buffer sess)
+                 (goto-char (point-max))
+                 (point))))
+      (cursor-acp--chat-insert sess "\n" t)
+      (cursor-acp--chat-insert
+       sess
+       (propertize (format "— Question %d/%d" n total) 'face '(bold font-lock-keyword-face))
+       t)
+      (cursor-acp--chat-insert sess "\n" t)
+      (let ((qprompt (cursor-acp--ht-get q "prompt")))
+        (when (and (stringp qprompt) (not (string-empty-p (string-trim qprompt))))
+          (cursor-acp--chat-insert sess (concat (string-trim qprompt) "\n") t)))
+      (dolist (p pairs)
+        (cursor-acp--chat-insert sess (format "%d. %s\n" (nth 0 p) (nth 1 p)) t))
+      (with-current-buffer (cursor-acp--session-chat-buffer sess)
+        (cursor-acp--hide-markup-region beg (point-max))))
+    pairs))
+
+(defun cursor-acp--ask-question-select-option-ids (prompt-prefix pairs allow-multiple)
+  (unless pairs
+    (user-error "Question has no options"))
+  (let ((nopts (length pairs))
+        (piece-width 30))
     (if allow-multiple
-        (let* ((id-set (mapcar (lambda (o) (string-trim (format "%s" (cursor-acp--ht-get o "id")))) opts))
-               (s (read-string (format "%s (comma-separated option ids): " prompt-prefix)))
-               (parts (split-string s "[,;[:space:]]+" t))
-               (bad (cl-remove-if (lambda (p) (cl-member p id-set :test #'string-equal)) parts)))
-          (when bad
-            (user-error "Unknown option id(s): %s" (string-join bad ", ")))
-          (when (null parts)
+        (let* ((prompt-pieces
+                (mapconcat
+                 (lambda (p)
+                   (format "[%d] %s" (nth 0 p) (cursor-acp--truncate-string (nth 1 p) piece-width)))
+                 pairs "  "))
+               (s (read-string (format "%s%s (comma-separated numbers): "
+                                       prompt-prefix prompt-pieces)))
+               (raw-parts (split-string s "[,;[:space:]]+" t))
+               (seen (make-hash-table :test #'eql))
+               out)
+          (unless raw-parts
             (user-error "Select at least one option"))
-          (cl-delete-duplicates parts :test #'string-equal))
-      (let ((n (length opts)))
-        (if (> n 9)
-            (let* ((ids (mapcar (lambda (o) (string-trim (format "%s" (cursor-acp--ht-get o "id")))) opts))
-                   (chosen (completing-read (format "%s option id: " prompt-prefix) ids nil t)))
-              (unless (cl-member chosen ids :test #'string-equal)
-                (user-error "Invalid option id"))
-              (list chosen))
-          (let* ((pairs
-                  (cl-loop for o in opts
-                           for i from 1
-                           collect
-                           (let ((oid (cursor-acp--ht-get o "id")))
-                             (list i (string-trim (format "%s" oid)) oid))))
-                 (prompt
-                  (format "%s%s: "
-                          prompt-prefix
-                          (mapconcat (lambda (p) (format "[%d] %s" (nth 0 p) (nth 1 p))) pairs "  ")))
-                 (choices (mapcar (lambda (p) (+ ?0 (nth 0 p))) pairs))
+          (dolist (part raw-parts)
+            (let* ((trim (string-trim part))
+                   idx)
+              (unless (string-empty-p trim)
+                (unless (string-match-p "\\`[0-9]+\\'" trim)
+                  (user-error "Invalid option number: %s" trim))
+                (setq idx (string-to-number trim))
+                (unless (cl-find-if (lambda (pr) (= (car pr) idx)) pairs)
+                  (user-error "Unknown option number: %d" idx))
+                (unless (gethash idx seen)
+                  (puthash idx t seen)
+                  (push (nth 2 (cl-find-if (lambda (pr) (= (car pr) idx)) pairs)) out)))))
+          (unless out
+            (user-error "Select at least one option"))
+          (nreverse out))
+      (if (<= nopts 9)
+          (let* ((prompt-pieces
+                  (mapconcat
+                   (lambda (p)
+                     (format "[%d] %s" (nth 0 p) (cursor-acp--truncate-string (nth 1 p) piece-width)))
+                   pairs "  "))
+                 (prompt (format "%s%s: " prompt-prefix prompt-pieces))
+                 (choices (mapcar (lambda (p) (+ ?0 (car p))) pairs))
                  (ch (read-char-choice prompt choices))
                  (idx (- ch ?0))
-                 (sel (cl-find-if (lambda (p) (= (nth 0 p) idx)) pairs)))
-            (list (string-trim (format "%s" (nth 2 sel))))))))))
+                 (sel (cl-find-if (lambda (pr) (= (car pr) idx)) pairs)))
+            (list (nth 2 sel)))
+        (let* ((prompt-pieces
+                (mapconcat
+                 (lambda (p)
+                   (format "[%d] %s" (car p) (cursor-acp--truncate-string (nth 1 p) piece-width)))
+                 pairs "\n"))
+               (s (read-string (format "%s\n%sOption number (1-%d): "
+                                       prompt-pieces prompt-prefix nopts)))
+               (trim (string-trim s)))
+          (unless (string-match-p "\\`[0-9]+\\'" trim)
+            (user-error "Invalid option number"))
+          (let* ((idx (string-to-number trim))
+                 (sel (cl-find-if (lambda (pr) (= (car pr) idx)) pairs)))
+            (unless sel
+              (user-error "Unknown option number: %d" idx))
+            (list (nth 2 sel))))))))
 
-(defun cursor-acp--prompt-ask-question-decision (sess params)
+(defun cursor-acp--prompt-ask-question-decision (sess params &optional skip-title)
   (let* ((questions (cursor-acp--normalize-items
                      (and (hash-table-p params) (cursor-acp--ht-get params "questions"))))
          (qhts (cl-remove-if-not #'hash-table-p questions))
+         (total (length qhts))
          (rows '()))
-    (cursor-acp--render-ask-question sess params)
     (when (null qhts)
       (user-error "Ask question request did not include questions"))
-    (dolist (q qhts)
-      (let* ((qid (cursor-acp--ht-get q "id"))
-             (qid0 (string-trim (format "%s" (or qid ""))))
-             (opts (cursor-acp--normalize-items (cursor-acp--ht-get q "options")))
-             (multi (and (cursor-acp--ht-get q "allowMultiple") t))
-             (picked (cursor-acp--ask-question-select-option-ids
-                      (format "ACP question [%s] " qid0) opts multi)))
-        (push `((questionId . ,qid0) (selectedOptionIds . ,(vconcat picked))) rows)))
+    (cursor-acp--render-ask-question-title sess params skip-title)
+    (cl-loop for q in qhts
+             for n from 1
+             do (let* ((qid0 (string-trim (format "%s" (or (cursor-acp--ht-get q "id") ""))))
+                       (multi (and (cursor-acp--ht-get q "allowMultiple") t))
+                       (pairs (cursor-acp--render-ask-question-question sess q n total))
+                       (picked-ids
+                        (cursor-acp--ask-question-select-option-ids
+                         (format "ACP question [%d/%d] " n total) pairs multi))
+                       (picked-labels
+                        (mapcar
+                         (lambda (oid)
+                           (nth 1 (cl-find-if (lambda (p) (string-equal oid (nth 2 p))) pairs)))
+                         picked-ids)))
+                  (cursor-acp--chat-insert
+                   sess
+                   (propertize (format "✅ Selected (q %d/%d): %s\n"
+                                       n total (string-join picked-labels ", "))
+                               'face '(bold success))
+                   t)
+                  (push `((questionId . ,qid0) (selectedOptionIds . ,(vconcat picked-ids)))
+                        rows)))
     (let ((answers (vconcat (nreverse rows))))
       (cursor-acp--chat-insert
        sess

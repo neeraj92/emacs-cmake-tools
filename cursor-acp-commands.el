@@ -1,6 +1,8 @@
 ;;; cursor-acp-commands.el --- Cursor ACP commands -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
+(require 'parse-time)
+(require 'subr-x)
 (require 'cursor-acp-core)
 (require 'cursor-acp-ui)
 (require 'cursor-acp-transport)
@@ -32,7 +34,14 @@
     (unless (file-directory-p proj)
       (user-error "No review seeds for this project"))
     (let* ((seed-files (directory-files-recursively proj ".*" nil nil))
-           (seed-files (cl-remove-if #'file-directory-p seed-files)))
+           (seed-files (cl-remove-if #'file-directory-p seed-files))
+           (root (cursor-acp--workspace-root sess))
+           (seed-files
+            (cl-remove-if
+             (lambda (p)
+               (cursor-acp--review-skip-path-p
+                sess (expand-file-name (file-relative-name p proj) root)))
+             seed-files)))
       (unless seed-files
         (user-error "No review seeds for this project"))
       (let* ((choices (mapcar (lambda (p) (file-relative-name p proj)) seed-files))
@@ -43,6 +52,21 @@
         (setq cursor-acp--review--ediff-abs-path abs-path)
         (add-hook 'ediff-after-quit-hook-internal #'cursor-acp--review--ediff-after-quit)
         (ediff-files seed-path abs-path)))))
+
+(defun cursor-acp-clear-reviews ()
+  "Delete all review seed files for this project's workspace."
+  (interactive)
+  (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session)))
+         (proj (cursor-acp--review-project-dir sess))
+         (label (directory-file-name (expand-file-name (cursor-acp--workspace-root sess)))))
+    (unless (file-directory-p proj)
+      (user-error "No review seed directory for this project"))
+    (unless (y-or-n-p (format "Delete all review seeds for %s? " label))
+      (user-error "Aborted"))
+    (cursor-acp--review-clear-project-seeds sess)
+    (message "Cleared review seeds for %s" label)))
 
 (defun cursor-acp-focus-input ()
   (interactive)
@@ -141,7 +165,7 @@
   (let* ((bootstrap (cursor-acp--ensure-session)))
     (cursor-acp--ensure-connected-session bootstrap)
     (let* ((base (or (cursor-acp--active-session) bootstrap))
-           (cwd (cursor-acp--workspace-root base))
+           (cwd (cursor-acp--rpc-agent-cwd bootstrap nil))
            (res (cursor-acp--rpc-call
                  base "session/new"
                  `((cwd . ,cwd)
@@ -149,7 +173,9 @@
            (sid (and (hash-table-p res) (gethash "sessionId" res nil))))
       (unless (stringp sid)
         (user-error "ACP session/new did not return sessionId"))
-      (let ((target (cursor-acp--ensure-session-by-id sid nil cwd)))
+      (let ((prev (cursor-acp--active-session))
+            (target (cursor-acp--ensure-session-by-id sid nil cwd)))
+        (cursor-acp--session-transcript-save prev)
         (cursor-acp--set-active-session-id sid)
         (cursor-acp--cache-session-new target res)
         (cursor-acp--chat-clear target)
@@ -309,6 +335,80 @@
        (prompt . [((type . "text")
                    (text . ,(string-trim (format "/%s %s" cmd-name (or arg "")))))])))))
 
+(defun cursor-acp--session-item-updated-time (it)
+  (let ((s (or (cursor-acp--ht-get it "updatedAt") "")))
+    (if (string-empty-p (string-trim s))
+        '(0 0 0)
+      (condition-case nil
+          (time-convert (parse-iso8601-time-string s) 'list)
+        (error '(0 0 0))))))
+
+(defun cursor-acp--session-picker-raw-items (sess)
+  (if (cursor-acp--cap-session-list-p)
+      (let* ((res (cursor-acp--rpc-session-list sess))
+             (sessions (and (hash-table-p res) (cursor-acp--ht-get res "sessions"))))
+        (cl-remove-if-not #'hash-table-p (cursor-acp--normalize-items sessions)))
+    (let (acc)
+      (when (hash-table-p cursor-acp--sessions)
+        (maphash
+         (lambda (k v)
+           (ignore k)
+           (when (and (cursor-acp--valid-session-p v)
+                      (stringp (cursor-acp--session-session-id v)))
+             (let ((ht (make-hash-table :test 'equal)))
+               (puthash "sessionId" (cursor-acp--session-session-id v) ht)
+               (puthash "title" (cursor-acp--session-title v) ht)
+               (puthash "cwd" (cursor-acp--session-cwd v) ht)
+               (push ht acc))))
+         cursor-acp--sessions))
+      (nreverse acc))))
+
+(defun cursor-acp--session-picker-rows (sess)
+  (let* ((raw-items (cursor-acp--session-picker-raw-items sess))
+         (items
+          (cl-stable-sort
+           raw-items
+           (lambda (a b)
+             (time-less-p (cursor-acp--session-item-updated-time b)
+                          (cursor-acp--session-item-updated-time a)))
+           :key #'identity))
+         (alist
+          (mapcar
+           (lambda (it)
+             (let* ((sid (cursor-acp--ht-get it "sessionId"))
+                    (title (or (cursor-acp--ht-get it "title") "Untitled"))
+                    (cwd (cursor-acp--ht-get it "cwd"))
+                    (updated (or (cursor-acp--ht-get it "updatedAt") "")))
+               (cons (format "%s%s"
+                             title
+                             (if (string-empty-p (string-trim updated)) "" (format "  (%s)" updated)))
+                     (list sid title cwd))))
+           items)))
+    (cons alist items)))
+
+(defun cursor-acp--local-server-session-ids ()
+  (let (out)
+    (when (hash-table-p cursor-acp--sessions)
+      (maphash
+       (lambda (_k sess)
+         (when (and (cursor-acp--valid-session-p sess)
+                    (let ((sid (cursor-acp--session-session-id sess)))
+                      (and (stringp sid) (not (string-empty-p sid)))))
+           (push (cursor-acp--session-session-id sess) out)))
+       cursor-acp--sessions))
+    (cl-delete-duplicates out :test #'string-equal)))
+
+(defun cursor-acp--close-session-id (operation-sess session-id)
+  (let ((target (cursor-acp--session-by-id session-id)))
+    (when (cursor-acp--valid-session-p target)
+      (cursor-acp--cancel-pending-permission target)
+      (cursor-acp--cancel-pending-ask-question target))
+    (cursor-acp--rpc-session-close operation-sess session-id)
+    (when (cursor-acp--valid-session-p target)
+      (cursor-acp--assistant-flush-frag target)
+      (cursor-acp--session-local-evict target)
+      (cursor-acp--rehome-active-session-after-removal session-id))))
+
 (defun cursor-acp-switch-session ()
   "List sessions and switch to one (load/resume), then reset layout."
   (interactive)
@@ -318,48 +418,30 @@
               (not (cursor-acp--conn-init-result (cursor-acp--ensure-conn))))
       (cursor-acp-start))
     (let* ((sess (cursor-acp--ensure-session))
-           (items
-            (if (cursor-acp--cap-session-list-p)
-                (let* ((res (cursor-acp--rpc-session-list sess))
-                       (sessions (and (hash-table-p res) (cursor-acp--ht-get res "sessions"))))
-                  (cl-remove-if-not #'hash-table-p (cursor-acp--normalize-items sessions)))
-              (let (acc)
-                (when (hash-table-p cursor-acp--sessions)
-                  (maphash
-                   (lambda (k v)
-                     (ignore k)
-                     (when (and (cursor-acp--valid-session-p v)
-                                (stringp (cursor-acp--session-session-id v)))
-                       (let ((ht (make-hash-table :test 'equal)))
-                         (puthash "sessionId" (cursor-acp--session-session-id v) ht)
-                         (puthash "title" (cursor-acp--session-title v) ht)
-                         (push ht acc))))
-                   cursor-acp--sessions))
-                (nreverse acc))))
-           (alist
-            (mapcar
-             (lambda (it)
-               (let* ((sid (cursor-acp--ht-get it "sessionId"))
-                      (title (or (cursor-acp--ht-get it "title") "Untitled"))
-                      (cwd (cursor-acp--ht-get it "cwd"))
-                      (updated (or (cursor-acp--ht-get it "updatedAt") "")))
-                 (cons (format "%s%s"
-                               title
-                               (if (string-empty-p (string-trim updated)) "" (format "  (%s)" updated)))
-                       (list sid title cwd))))
-             items))
-           (choice (completing-read "Session: " (mapcar #'car alist) nil t))
+           (rows (cursor-acp--session-picker-rows sess))
+           (alist (car rows))
+           (cands (mapcar #'car alist))
+           (completion-table
+            (lambda (string pred action)
+              (if (eq action 'metadata)
+                  '(metadata (cycle-sort-function . identity)
+                    (display-sort-function . identity))
+                (complete-with-action action cands string pred))))
+           (choice (completing-read "Session: " completion-table nil t))
            (sel (cdr (assoc choice alist)))
            (sid (nth 0 sel))
            (title (nth 1 sel))
            (cwd (nth 2 sel)))
       (unless (stringp sid)
         (user-error "No session selected"))
-      (let ((target (cursor-acp--ensure-session-by-id sid title cwd)))
+      (let ((prev (cursor-acp--active-session))
+            (target (cursor-acp--ensure-session-by-id sid title cwd)))
+        (cursor-acp--session-transcript-save prev)
         (cursor-acp--set-active-session-id sid)
         (cursor-acp--ensure-session-buffers target)
         (cursor-acp-reset-layout)
         (cursor-acp--chat-clear target)
+        (cursor-acp--session-transcript-load-into-chat target)
         (if (cursor-acp--cap-load-session-p)
             (cursor-acp--rpc-session-load target sid)
           (when (cursor-acp--cap-session-resume-p)

@@ -122,7 +122,8 @@
                        (abs (if (file-name-absolute-p path)
                                 (expand-file-name path)
                               (expand-file-name path root))))
-                  (when (cursor-acp--path-in-workspace-p abs (cursor-acp--session-workspace-root sess))
+                  (when (and (cursor-acp--path-in-workspace-p abs (cursor-acp--session-workspace-root sess))
+                             (not (cursor-acp--review-skip-path-p sess abs)))
                     (cursor-acp--review-ensure-seed sess abs (or old-text (cursor-acp--review-file-text abs))))
                   (cursor-acp--render-diff-block sess path (or old-text "") new-text))
               (error nil)))))
@@ -141,14 +142,19 @@
 (defun cursor-acp--session-workspace-root (sess)
   "Return the workspace root directory for SESS.
 
-Uses the session's main buffer `default-directory' when available, else falls
-back to global `default-directory'."
-  (let* ((mb (and (cursor-acp--valid-session-p sess)
-                  (cursor-acp--session-main-buffer sess)))
-         (dir (if (buffer-live-p mb)
-                  (with-current-buffer mb default-directory)
-                default-directory)))
-    (file-name-as-directory (expand-file-name dir))))
+When the session has a stored `cwd' (from the agent), use that; otherwise use
+the session's main buffer `default-directory' when available, else global
+`default-directory'."
+  (if (and (cursor-acp--valid-session-p sess)
+           (let ((c (cursor-acp--session-cwd sess)))
+             (and (stringp c) (not (string-empty-p (string-trim c))))))
+      (cursor-acp--workspace-root sess)
+    (let* ((mb (and (cursor-acp--valid-session-p sess)
+                    (cursor-acp--session-main-buffer sess)))
+           (dir (if (buffer-live-p mb)
+                    (with-current-buffer mb default-directory)
+                  default-directory)))
+      (file-name-as-directory (expand-file-name dir)))))
 
 (defun cursor-acp--path-in-workspace-p (path root)
   (let* ((p (file-truename (expand-file-name path)))
@@ -600,7 +606,7 @@ back to global `default-directory'."
     (let* ((tool-call-id (cursor-acp--session-ask-question-tool-call-id sess))
            (cache (cursor-acp--session-ask-question-response-cache sess))
            (ids (or (cursor-acp--session-ask-question-request-ids sess) (list rid)))
-           (outcome (cursor-acp--prompt-ask-question-decision sess params)))
+           (outcome (cursor-acp--prompt-ask-question-decision sess params t)))
       (when (and tool-call-id (hash-table-p cache))
         (puthash tool-call-id outcome cache))
       (dolist (rid0 ids)
@@ -928,6 +934,7 @@ back to global `default-directory'."
     (when (and sess (eq proc (cursor-acp--conn-process conn)))
       (cursor-acp--log sess "process" (string-trim event))
       (cursor-acp--assistant-flush-frag sess)
+      (cursor-acp--session-transcript-save sess)
       (cursor-acp--set-busy sess nil)
       (setf (cursor-acp--conn-process conn) nil)
       (ignore-errors (cursor-acp--chat-refresh-header sess))
@@ -954,6 +961,35 @@ back to global `default-directory'."
         (cursor-acp--chat-refresh-header sess)
         proc))))
 
+(defun cursor-acp--session-new-cwd (sess)
+  (let ((root-buf
+         (or (let ((pb (cursor-acp--preferred-main-buffer)))
+               (if (buffer-live-p pb) pb nil))
+             (let ((mb (and sess (cursor-acp--session-main-buffer sess))))
+               (when (buffer-live-p mb) mb))
+             (current-buffer))))
+    (with-current-buffer root-buf
+      (expand-file-name
+       (let ((proj (and (fboundp 'projectile-project-root)
+                        (ignore-errors (projectile-project-root)))))
+         (if (and (stringp proj) (not (string-empty-p (string-trim proj))))
+             proj
+           default-directory))))))
+
+(defun cursor-acp--normalize-agent-cwd (dir)
+  (unless (and (stringp dir) (not (string-empty-p (string-trim dir))))
+    (error "cursor-acp--normalize-agent-cwd: missing directory"))
+  (directory-file-name (file-truename (expand-file-name dir))))
+
+(defun cursor-acp--rpc-agent-cwd (sess &optional existing-session-p)
+  (cursor-acp--normalize-agent-cwd
+   (if (and existing-session-p
+            (cursor-acp--valid-session-p sess)
+            (let ((c (cursor-acp--session-cwd sess)))
+              (and (stringp c) (not (string-empty-p (string-trim c))))))
+       (cursor-acp--session-cwd sess)
+     (cursor-acp--session-new-cwd sess))))
+
 (defun cursor-acp--handshake (sess)
   (let ((init-res
          (cursor-acp--rpc-call
@@ -967,7 +1003,7 @@ back to global `default-directory'."
       (setf (cursor-acp--conn-init-result (cursor-acp--ensure-conn)) init-res)
       (cursor-acp--cache-capabilities sess init-res)))
   (cursor-acp--rpc-call sess "authenticate" '((methodId . "cursor_login")))
-  (let* ((cwd (expand-file-name default-directory))
+  (let* ((cwd (cursor-acp--rpc-agent-cwd sess nil))
          (res (cursor-acp--rpc-call
                sess "session/new"
                `((cwd . ,cwd)
@@ -1050,7 +1086,7 @@ back to global `default-directory'."
     (user-error "Agent does not advertise sessionCapabilities.list"))
   (cursor-acp--rpc-call
    sess "session/list"
-   `((cwd . ,(expand-file-name default-directory))
+   `((cwd . ,(cursor-acp--rpc-agent-cwd sess nil))
      ,@(when (and (stringp cursor) (not (string-empty-p cursor)))
          `((cursor . ,cursor))))))
 
@@ -1060,7 +1096,7 @@ back to global `default-directory'."
   (cursor-acp--rpc-send-async
    sess "session/load"
    `((sessionId . ,session-id)
-     (cwd . ,(expand-file-name default-directory))
+     (cwd . ,(cursor-acp--rpc-agent-cwd sess t))
      (mcpServers . []))
    session-id))
 
@@ -1070,8 +1106,33 @@ back to global `default-directory'."
   (cursor-acp--rpc-call
    sess "session/resume"
    `((sessionId . ,session-id)
-     (cwd . ,(expand-file-name default-directory))
+     (cwd . ,(cursor-acp--rpc-agent-cwd sess t))
      (mcpServers . []))))
+
+(defun cursor-acp--rpc-session-close (sess session-id)
+  (cursor-acp--rpc-call
+   sess "session/close"
+   `((sessionId . ,session-id))))
+
+(defun cursor-acp--rpc-session-list-all-items (sess)
+  (when (cursor-acp--cap-session-list-p)
+    (let ((by-id (make-hash-table :test 'equal))
+          (cursor nil))
+      (cl-loop
+       (let* ((res (cursor-acp--rpc-session-list sess cursor))
+              (sessions (and (hash-table-p res) (cursor-acp--ht-get res "sessions")))
+              (next (and (hash-table-p res) (cursor-acp--ht-get res "nextCursor")))
+              (items (cl-remove-if-not #'hash-table-p (cursor-acp--normalize-items sessions))))
+         (dolist (it items)
+           (let ((sid (cursor-acp--ht-get it "sessionId")))
+             (when (and (stringp sid) (not (string-empty-p sid)))
+               (puthash sid it by-id))))
+         (if (and (stringp next) (not (string-empty-p (string-trim next))))
+             (setq cursor next)
+           (cl-return))))
+      (let (out)
+        (maphash (lambda (_k v) (push v out)) by-id)
+        (nreverse out)))))
 
 (provide 'cursor-acp-transport)
 ;;; cursor-acp-transport.el ends here
