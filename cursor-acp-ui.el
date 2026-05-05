@@ -2,6 +2,7 @@
 
 (require 'cl-lib)
 (require 'cursor-acp-core)
+(require 'evil)
 (autoload 'markdown-mode "markdown-mode" nil t)
 (autoload 'gfm-mode "markdown-mode" nil t)
 
