@@ -159,6 +159,22 @@
        (cursor-acp--render-info sess)
        (signal (car err) (cdr err))))))
 
+(defun cursor-acp-toggle-todo-view ()
+  (interactive)
+  (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                   (cursor-acp--active-session)
+                   (cursor-acp--ensure-session)))
+         (display (cursor-acp--session-display-plan-buffer sess))
+         (plan (cursor-acp--session-plan-buffer sess)))
+
+    (when (and display (buffer-live-p plan))
+      (let ((win (get-buffer-window plan t)))
+        (when (window-live-p win)
+          (delete-window win))))
+
+    (setf (cursor-acp--session-display-plan-buffer sess) (not display))
+    (cursor-acp--ensure-pane sess)))
+
 (defun cursor-acp-new-session ()
   "Create a new ACP session and switch UI to it."
   (interactive)

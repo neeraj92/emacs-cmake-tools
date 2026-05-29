@@ -71,6 +71,7 @@
   tool-calls
   plan-entries
   plan-buffer
+  display-plan-buffer
   awaiting-create-plan
   create-plan-request-id
   create-plan-request-params
@@ -382,6 +383,7 @@ named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
                   :tool-calls (make-hash-table :test #'equal)
                   :plan-entries nil
                   :plan-buffer nil
+                  :display-plan-buffer nil
                   :awaiting-create-plan nil
                   :create-plan-request-id nil
                   :create-plan-request-params nil
@@ -591,6 +593,7 @@ named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
                   :tool-calls (make-hash-table :test #'equal)
                   :plan-entries nil
                   :plan-buffer nil
+                  :display-plan-buffer nil
                   :awaiting-create-plan nil
                   :create-plan-request-id nil
                   :create-plan-request-params nil

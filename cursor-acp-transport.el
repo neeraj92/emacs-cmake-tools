@@ -1091,14 +1091,19 @@ the session's main buffer `default-directory' when available, else global
          `((cursor . ,cursor))))))
 
 (defun cursor-acp--rpc-session-load (sess session-id)
+  (message "Loading session")
   (unless (cursor-acp--cap-load-session-p)
     (user-error "Agent does not advertise loadSession"))
-  (cursor-acp--rpc-send-async
-   sess "session/load"
-   `((sessionId . ,session-id)
-     (cwd . ,(cursor-acp--rpc-agent-cwd sess t))
-     (mcpServers . []))
-   session-id))
+  (let ((res (cursor-acp--rpc-call
+              sess "session/load"
+              `((sessionId . ,session-id)
+                (cwd . ,(cursor-acp--rpc-agent-cwd sess t))
+                (mcpServers . [])))))
+    (message "Reloading session with rpc call")
+    (when (hash-table-p res)
+      (cursor-acp--cache-session-new sess res))
+    )
+  )
 
 (defun cursor-acp--rpc-session-resume (sess session-id)
   (unless (cursor-acp--cap-session-resume-p)

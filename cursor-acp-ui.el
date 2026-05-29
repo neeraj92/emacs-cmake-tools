@@ -183,7 +183,7 @@
           (set-window-parameter input-win 'cursor-acp-pane t)
           (set-window-dedicated-p input-win t)
           (cursor-acp--pane-allow-resize input-win)
-          (when (buffer-live-p plan)
+          (when (and (buffer-live-p plan) (cursor-acp--session-display-plan-buffer sess))
             (let ((plan-win
                    (or (cl-find-if
                         #'cursor-acp--pane-window-p
@@ -251,6 +251,7 @@
         (cursor-acp--plan-buffer-after-insert-markdown-view)
         (goto-char (point-min))
         (setq-local buffer-read-only t)))
+    (setf (cursor-acp--session-display-plan-buffer sess) t)
     (cursor-acp--ensure-pane sess)
     (cursor-acp--ensure-plan-window-height sess)))
 
