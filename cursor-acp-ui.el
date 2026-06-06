@@ -2,7 +2,7 @@
 
 (require 'cl-lib)
 (require 'cursor-acp-core)
-(require 'evil)
+
 (autoload 'markdown-mode "markdown-mode" nil t)
 (autoload 'gfm-mode "markdown-mode" nil t)
 
@@ -866,6 +866,15 @@
     (define-key map (kbd "C-i") #'cursor-acp-toggle-section)
     map))
 
+(defvar cursor-acp-input-mode-map
+  (let ((map (copy-keymap text-mode-map)))
+    (define-key map (kbd "RET") #'cursor-acp-send)
+    (define-key map (kbd "C-j") #'newline)
+    (define-key map (kbd "SPC") #'cursor-acp--space)
+    (define-key map (kbd "C-c C-p") (lambda () (interactive) (cursor-acp--input-focus (cursor-acp--ensure-session))))
+    map))
+
+
 (define-derived-mode cursor-acp-input-mode text-mode "Cursor-ACP-Input"
   "Major mode for Cursor ACP input buffer."
   (setq-local truncate-lines nil)
@@ -884,14 +893,6 @@
           (completion-in-region-mode -1)
           (self-insert-command n))
       (self-insert-command n))))
-
-(defvar cursor-acp-input-mode-map
-  (let ((map (copy-keymap text-mode-map)))
-    (define-key map (kbd "RET") #'cursor-acp-send)
-    (define-key map (kbd "C-j") #'newline)
-    (define-key map (kbd "SPC") #'cursor-acp--space)
-    (define-key map (kbd "C-c C-p") (lambda () (interactive) (cursor-acp--input-focus (cursor-acp--ensure-session))))
-    map))
 
 (defvar cursor-acp-chat-mode-map
   (let ((map (copy-keymap text-mode-map)))
