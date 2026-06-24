@@ -1,6 +1,17 @@
 (require 'projectile)
 (require 'json)
 (require 'lsp)
+(require 'cl-lib)
+
+;;; Commentary:
+;;; emacs-cmake-tools is a package to provide helper functions to run cmake and ctest commands.
+;;; Recent additions include support for CMake Presets (CMakePresets.json / CMakeUserPresets.json) via the `ect/cmake-use-presets` toggle.
+;;;
+;;; This package also provides functionality for defining and running custom executable targets.
+;;; Users can create a `.ect.run.json` file in their project root to specify named targets
+;;; with their binaries, arguments, working directories, and environment variables.
+;;; Interactive functions like `ect/add-run-target` (to define new targets) and
+;;; `ect/execute-run-target` (to choose and run a target) are available.
 
 ;;; Code:
 ;;; Path to cmake binary
@@ -19,6 +30,15 @@
 (defcustom ect/cmake-build-directory-prefix "build"
   "Prefix to the relative path inside the project directory."
   :type 'string
+  :group 'emacs-cmake-tools)
+
+(defcustom ect/cmake-use-presets nil
+  "Enable CMake preset mode.
+When t, emacs-cmake-tools searches for `CMakePresets.json` or
+`CMakeUserPresets.json` in the project root. Found presets populate
+build configuration choices, overriding `ect/cmake-build-types`.
+The selected preset name is then used with `cmake --preset <name>`."
+  :type 'boolean
   :group 'emacs-cmake-tools)
 
 ;;; Toggle to enable generating compilation database
@@ -47,7 +67,9 @@
 
 ;;; Variable to represent the different build types
 (defcustom ect/cmake-build-types '("Release" "Debug" "RelWithDebInfo" "ReleaseShared" "DebugShared")
-  "List of available build types."
+  "List of available build types.
+Used when `ect/cmake-use-presets` is `nil` or if no valid CMake
+preset file is found in the project."
   :type '(repeat strings)
   :group 'emacs-cmake-tools)
 
@@ -113,6 +135,115 @@
 (defvar ect/project-settings (make-hash-table :test 'equal)
   "Local project settings so that it doesnt have to be configured every time.")
 
+(defconst ect/cmake-user-preset-file-name "CMakeUserPresets.json"
+  "Default name for CMake user presets file.")
+
+(defconst ect/cmake-preset-file-name "CMakePresets.json"
+  "Default name for CMake presets file.")
+
+(defconst ect/run-config-file-name ".ect.run.json"
+  "Default filename for run configurations.")
+
+;;; User-defined Run Targets (.ect.run.json)
+;;
+;; Users can define custom executable targets in a file named .ect.run.json
+;; located in the project root. This file should contain a JSON array
+;; of objects, where each object defines a "run target".
+;;
+;; Each run target object has the following structure:
+;; {
+;;   "name":   "string",  ; A unique name for this run target (e.g., "run-app-debug").
+;;   "binary": "string",  ; Absolute path to the executable.
+;;   "args":   ["string"],; Array of command-line arguments.
+;;   "cwd":    "string",  ; Working directory for execution (e.g., "/path/to/project/build").
+;;                        ; Defaults to project root if not specified or empty during creation.
+;;   "env":    ["string"] ; Array of environment variables in "VAR=VALUE" format.
+;; }
+;;
+;; Example .ect.run.json:
+;; [
+;;   {
+;;     "name": "run-my-server",
+;;     "binary": "/home/user/project/build/server",
+;;     "args": ["--port", "8080", "--verbose"],
+;;     "cwd": "/home/user/project/build",
+;;     "env": ["LD_LIBRARY_PATH=/opt/custom/lib", "DEBUG_MODE=1"]
+;;   }
+;; ]
+
+(defun ect/get-run-config-file-path ()
+  "Return the absolute path to the .ect.run.json file in the current project root."
+  (concat (projectile-project-root) "/" ect/run-config-file-name))
+
+(defun ect/load-run-configurations ()
+  "Load run configurations from .ect.run.json.
+Returns a list of alists, or nil on error/not found."
+  (let ((path (ect/get-run-config-file-path)))
+    (unless (file-exists-p path)
+      (cl-return-from ect/load-run-configurations nil))
+    (condition-case err
+        (with-temp-buffer
+          (insert-file-contents path)
+          (json-parse-buffer :object-type 'alist :array-type 'list :false-value 'json-false))
+      (json-parsing-error
+       (message "Error parsing .ect.run.json: %s" (error-message-string err))
+       nil))))
+
+(defun ect/save-run-configurations (configurations)
+  "Save the list of run CONFIGURATIONS (list of alists) to .ect.run.json."
+  (let ((path-to-save (ect/get-run-config-file-path))
+        (json-pretty-print t)) ; Enable pretty-printing for json-encode
+    (write-region (json-encode configurations) nil path-to-save)))
+
+(defun ect/find-preset-file (project-root)
+  "Find the CMake preset file in PROJECT-ROOT.
+Checks for `CMakeUserPresets.json` first, then `CMakePresets.json`.
+Returns the full path to the file if found, otherwise nil."
+  (let ((user-preset-file (concat project-root "/" ect/cmake-user-preset-file-name))
+        (preset-file (concat project-root "/" ect/cmake-preset-file-name)))
+    (cond
+     ((file-exists-p user-preset-file) user-preset-file)
+     ((file-exists-p preset-file) preset-file)
+     (t nil))))
+
+(defun ect/parse-presets (preset-file-path)
+  "Parse CMake preset file PRESET-FILE-PATH and return a list of preset names.
+Returns nil if the file does not exist, JSON parsing fails, or the
+expected structure is not found."
+  (unless (and preset-file-path (file-exists-p preset-file-path))
+    (message "Preset file does not exist: %s" preset-file-path)
+    (cl-return-from ect/parse-presets nil))
+
+  (let ((json-object nil)
+        (preset-names nil))
+    (with-temp-buffer
+      (insert-file-contents preset-file-path)
+      (condition-case err
+          (setq json-object (json-parse-buffer :object-type 'hash-table))
+        (error
+         (message "Error parsing CMake preset file: %s. Error: %s" preset-file-path err)
+         (cl-return-from ect/parse-presets nil))))
+
+    (unless (hash-table-p json-object)
+      (message "Invalid JSON structure in preset file: %s. Root is not an object." preset-file-path)
+      (cl-return-from ect/parse-presets nil))
+
+    (let ((configure-presets (gethash "configurePresets" json-object)))
+      (unless configure-presets
+        (message "No 'configurePresets' key found in CMake preset file: %s" preset-file-path)
+        (cl-return-from ect/parse-presets nil))
+
+      (unless (vectorp configure-presets)
+        (message "'configurePresets' is not a JSON array in preset file: %s" preset-file-path)
+        (cl-return-from ect/parse-presets nil))
+
+      (dotimes (i (length configure-presets))
+        (let* ((preset (aref configure-presets i))
+               (name (gethash "name" preset)))
+          (when (stringp name)
+            (add-to-list 'preset-names name))))
+      (nreverse preset-names))))
+
 (defun ect/remove-tramp-prefix (path)
   "Remove TRAMP prefix from PATH if it exists."
   (if (tramp-tramp-file-p path)
@@ -121,10 +252,25 @@
     path))
 
 (defun ect/cmake-generate-configure-command (build-directory)
-  "Helper function for generating the configure command."
-
-  (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory " -B " build-directory " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type " -G " ect/cmake-current-generator " " ect/project-cmake-configure-args))
-  configure_cmd)
+  "Helper function for generating the CMake configure command.
+If `ect/cmake-use-presets` is `t` and `ect/local-cmake-build-type`
+contains a selected preset name, the command will use `cmake --preset <preset-name>`.
+In this mode, `-DCMAKE_BUILD_TYPE` and `-G` are omitted from the command line
+as they are expected to be defined by the preset.
+Otherwise, constructs the command using `ect/local-cmake-build-type` for `-DCMAKE_BUILD_TYPE`
+and `ect/cmake-current-generator` for `-G`."
+  (let ((configure_cmd ""))
+    (if ect/cmake-use-presets
+        (setq configure_cmd (concat ect/cmake-binary " --preset " ect/local-cmake-build-type
+                                    " -S " ect/cmake-source-directory
+                                    " -B " build-directory
+                                    " " ect/project-cmake-configure-args))
+      (setq configure_cmd (concat ect/cmake-binary " -S " ect/cmake-source-directory
+                                    " -B " build-directory
+                                    " -DCMAKE_BUILD_TYPE=" ect/local-cmake-build-type
+                                    " -G " ect/cmake-current-generator
+                                    " " ect/project-cmake-configure-args)))
+    configure_cmd))
 
 (defun ect/cmake-generate-build-command (build-directory)
   "Helper function to gernrate the build command."
@@ -143,11 +289,28 @@
   path-to-return)
 
 (defun ect/cmake-choose-build-type ()
-  "Helper function to choose the build type."
+  "Helper function to choose the build configuration.
+If `ect/cmake-use-presets` is enabled and a valid CMake preset file
+(CMakePresets.json or CMakeUserPresets.json) is found in the project root,
+this function will offer a choice from the discovered preset names.
+The selected preset name is stored in `ect/local-cmake-build-type`.
+Otherwise, it offers a choice from the `ect/cmake-build-types` list."
   (interactive)
-  (setq ect/local-cmake-build-type (completing-read "Choose build type :" ect/cmake-build-types))
-  (ect/save-project-settings)
-  )
+  (let ((project-root (projectile-project-root)))
+    (if ect/cmake-use-presets
+        (let ((preset-file-path (ect/find-preset-file project-root)))
+          (if preset-file-path
+              (let ((preset-names (ect/parse-presets preset-file-path)))
+                (if (and preset-names (not (eq (length preset-names) 0)))
+                    (setq ect/local-cmake-build-type (completing-read "Choose preset: " preset-names nil t nil))
+                  (progn
+                    (message "No presets found or error parsing preset file. Falling back to default build types.")
+                    (setq ect/local-cmake-build-type (completing-read "Choose build type: " ect/cmake-build-types nil t nil)))))
+            (progn
+              (message "No CMake preset file found in project root. Falling back to default build types.")
+              (setq ect/local-cmake-build-type (completing-read "Choose build type: " ect/cmake-build-types nil t nil)))))
+      (setq ect/local-cmake-build-type (completing-read "Choose build type: " ect/cmake-build-types nil t nil))))
+  (ect/save-project-settings))
 
 (defun ect/cmake-build-target ()
   "Helper function to narrow down the build to a specific target."
@@ -364,6 +527,81 @@
   (setq ect/project-cmake-build-args args)
   (ect/save-project-settings)
   )
+
+(defun ect/add-run-target ()
+  "Interactively prompts for the details of a new executable run target (name, binary path, arguments, working directory, and environment variables) and adds it to the `.ect.run.json` file in the project root."
+  (interactive)
+  (let* ((target-name (read-string "Run target name: "))
+         (target-binary (read-file-name "Path to executable: " (projectile-project-root) nil t))
+         (target-args
+          (let ((args '()) (arg-input ""))
+            (while (not (string-empty-p (setq arg-input (read-string "Argument (empty to finish): "))))
+              (push arg-input args))
+            (nreverse args)))
+         (target-cwd (read-directory-name "Working directory: " (projectile-project-root)))
+         (target-env
+          (let ((env-vars '()) (env-input ""))
+            (while (not (string-empty-p (setq env-input (read-string "Environment variable (VAR=VAL, empty to finish): "))))
+              (push env-input env-vars))
+            (nreverse env-vars)))
+         (new-target `((name . ,target-name)
+                       (binary . ,target-binary)
+                       (args . ,target-args)
+                       (cwd . ,target-cwd)
+                       (env . ,target-env)))
+         (configurations (or (ect/load-run-configurations) '()))
+         (updated-configurations (cons new-target configurations)))
+    (ect/save-run-configurations updated-configurations)
+    (message "Run target '%s' added to .ect.run.json." target-name)))
+
+(defun ect/choose-run-target ()
+  "Loads run target configurations from `.ect.run.json` in the project root, prompts the user to select one by its name using completing-read, and returns the chosen target's configuration as an alist. Returns nil if no targets are defined or if the user aborts selection."
+  (interactive)
+  (let ((configurations (ect/load-run-configurations)))
+    (if (not configurations)
+        (progn
+          (message "No run targets defined. Use 'ect/add-run-target' to create one.")
+          nil)
+      (let* ((target-names (mapcar (lambda (target) (cdr (assoc 'name target))) configurations))
+             (selected-name (completing-read "Choose run target: " target-names nil t)))
+        (if selected-name
+            (cl-find-if (lambda (target) (string-equal (cdr (assoc 'name target)) selected-name))
+                        configurations)
+          nil)))))
+
+(defun ect/execute-run-target ()
+  "Interactively select a predefined run target and execute it.
+This function first calls `ect/choose-run-target` to allow selection.
+If a target is chosen, its binary is executed with the specified arguments,
+working directory, and environment variables.
+- Output is displayed in the standard *compilation* buffer.
+- Environment variables from the target's configuration are temporarily
+  set for the spawned subprocess and the original Emacs subprocess
+  environment is restored afterwards.
+- The working directory is temporarily changed to the target's 'cwd'
+  for the duration of the command execution."
+  (interactive)
+  (let* ((target (ect/choose-run-target)))
+    (if (not target)
+        (message "No run target selected.")
+      (let* ((target-name (cdr (assoc 'name target)))
+             (target-binary (cdr (assoc 'binary target)))
+             (target-args (cdr (assoc 'args target)))
+             (target-cwd (cdr (assoc 'cwd target)))
+             (target-env (cdr (assoc 'env target)))
+             (original-env (mapcar #'identity (process-environment)))) ; Store original env
+        (let ((default-directory target-cwd)) ; Set working directory
+          ;; Set environment variables (affects Emacs subprocess environment)
+          (dolist (env-var target-env)
+            (let* ((parts (split-string env-var "=")))
+              (when (= (length parts) 2)
+                (setenv (car parts) (cadr parts)))))
+          ;; Construct and run the command
+          (let ((command-string (string-join (cons target-binary target-args) " ")))
+            (message "Executing: %s in %s (Name: %s)" command-string default-directory target-name)
+            (compile command-string))
+          ;; Restore original environment
+          (setq process-environment original-env))))))
 
 
 (provide 'emacs-cmake-tools)
