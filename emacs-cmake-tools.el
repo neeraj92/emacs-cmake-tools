@@ -1,6 +1,7 @@
 (require 'projectile)
 (require 'json)
 (require 'lsp)
+(require 'tramp)
 
 ;;; Code:
 ;;; Path to cmake binary
@@ -80,6 +81,11 @@
 
 (defcustom ect/cmake-source-directory nil
   "Source directory to use for the build."
+  :type 'string
+  :group 'emacs-cmake-tools)
+
+(defcustom ect/cmake-pre-build-script nil
+  "Pre build script to be run before building"
   :type 'string
   :group 'emacs-cmake-tools)
 
@@ -247,6 +253,11 @@
   ;;  (message "Cmake targets : %s" ect/cmake-targets)
   )
 
+(defun ect/set-pre-build-script (script)
+  "Set the value of pre build script."
+  (interactive "sPre-build script:")
+  (setq ect/cmake-pre-build-script script))
+
 (defun ect/cmake-build-project ()
   "Build the project."
   (interactive)
@@ -261,6 +272,8 @@
           (message "Updated target : %s " build_cmd))
       )
     (setq build_cmd (concat build_cmd  " " ect/project-cmake-build-args))
+    (when (boundp 'ect/cmake-pre-build-script)
+      (setq build_cmd (concat ect/cmake-pre-build-script ";" build_cmd)))
     (compile build_cmd))
   )
 
@@ -273,6 +286,7 @@
   (puthash "build-type" ect/local-cmake-build-type ect/project-settings)
   (puthash "project-cmake-configure-args" ect/project-cmake-configure-args ect/project-settings)
   (puthash "project-cmake-build-args" ect/project-cmake-build-args ect/project-settings)
+  (puthash "cmake-pre-build-script" ect/cmake-pre-build-script ect/project-settings)
   (let ((json-project-settings (json-encode ect/project-settings))
         (path-to-save (ect/project-settings-file-path)))
     (message "Writing settings file to path %s" path-to-save)
@@ -294,7 +308,6 @@
     (when value
       (setq ect/cmake-current-target value)
       t))
-
   (let ((value (gethash "generator" ect/project-settings)))
     (when value
       (setq ect/cmake-current-generator value)
@@ -307,12 +320,14 @@
     (when value
       (setq ect/project-cmake-build-args value)
       t))
-
   (let ((value (gethash "build-type" ect/project-settings)))
     (when value
       (setq ect/local-cmake-build-type value)
       t))
-
+  (let ((value (gethash "cmake-pre-build-script" ect/project-settings)))
+    (when value
+      (setq ect/cmake-pre-build-script value)
+      t))
   )
 
 (defun ect/initialize-ect ()
