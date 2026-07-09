@@ -121,7 +121,7 @@
 
 (defun ect/remove-tramp-prefix (path)
   "Remove TRAMP prefix from PATH if it exists."
-  (if (tramp-tramp-file-p path)
+  (if (file-remote-p path)
       (tramp-file-name-localname
        (tramp-dissect-file-name path))
     path))

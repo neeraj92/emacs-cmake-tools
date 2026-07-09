@@ -458,6 +458,7 @@
         (cursor-acp-reset-layout)
         (cursor-acp--chat-clear target)
         (cursor-acp--session-transcript-load-into-chat target)
+        (cursor-acp--schedule-preview target)
         (if (cursor-acp--cap-load-session-p)
             (cursor-acp--rpc-session-load target sid)
           (when (cursor-acp--cap-session-resume-p)

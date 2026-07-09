@@ -92,6 +92,9 @@
   ask-question-request-params
   ask-question-response-cache
   assistant-frag
+  transcript-text
+  assistant-open
+  preview-dirty
   draft-input
   main-buffer
   chat-buffer
@@ -184,6 +187,15 @@ named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
   :type 'directory
   :group 'cursor-acp)
 
+(defcustom cursor-acp-preview-enabled t
+  "When non-nil, fontify the chat transcript preview with `gfm-mode'.
+
+The transcript markdown is re-inserted into the chat buffer and
+fontified so code blocks, diff blocks and GFM checkboxes are styled
+and markup is hidden. When nil, the raw markdown text is shown."
+  :type 'boolean
+  :group 'cursor-acp)
+
 (defun cursor-acp--review--sanitize (s)
   (replace-regexp-in-string "[^A-Za-z0-9_.-]" "_" (or s "")))
 
@@ -222,28 +234,22 @@ named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
   (when (and (cursor-acp--valid-session-p sess)
              (let ((sid (cursor-acp--session-session-id sess)))
                (and (stringp sid) (not (string-empty-p sid)))))
-    (when-let ((path (cursor-acp--session-transcript-file sess))
-               (buf (cursor-acp--session-chat-buffer sess)))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (let ((text (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
-            (unless (string-empty-p text)
-              (let ((dir (file-name-directory path)))
-                (when (and (stringp dir) (not (file-directory-p dir)))
-                  (make-directory dir t))
-                (write-region text nil path nil 'quiet)))))))))
+    (when-let ((path (cursor-acp--session-transcript-file sess)))
+      (let ((text (string-trim (or (cursor-acp--session-transcript-text sess) ""))))
+        (unless (string-empty-p text)
+          (let ((dir (file-name-directory path)))
+            (when (and (stringp dir) (not (file-directory-p dir)))
+              (make-directory dir t))
+            (write-region text nil path nil 'quiet)))))))
 
 (defun cursor-acp--session-transcript-load-into-chat (sess)
-  (when-let ((path (cursor-acp--session-transcript-file sess))
-             (buf (cursor-acp--session-chat-buffer sess)))
-    (when (and (file-readable-p path) (buffer-live-p buf))
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (goto-char (point-min))
-          (insert-file-contents path)))
-      (with-current-buffer buf
-        (setq-local cursor-acp--assistant-open nil)
-        (setq-local cursor-acp--assistant-start nil))
+  (when-let ((path (cursor-acp--session-transcript-file sess)))
+    (when (file-readable-p path)
+      (setf (cursor-acp--session-transcript-text sess)
+            (with-temp-buffer
+              (insert-file-contents path)
+              (buffer-string)))
+      (setf (cursor-acp--session-assistant-open sess) nil)
       t)))
 
 (defun cursor-acp--review-seed-path (sess abs-path)
@@ -404,6 +410,9 @@ named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
                   :ask-question-request-params nil
                   :ask-question-response-cache (make-hash-table :test #'equal)
                   :assistant-frag ""
+                  :transcript-text ""
+                  :assistant-open nil
+                  :preview-dirty nil
                   :draft-input ""
                   :main-buffer nil
                   :chat-buffer nil
@@ -614,6 +623,9 @@ named \"transcript\". This tree is separate from `cursor-acp-review-root-dir'."
                   :ask-question-request-params nil
                   :ask-question-response-cache (make-hash-table :test #'equal)
                   :assistant-frag ""
+                  :transcript-text ""
+                  :assistant-open nil
+                  :preview-dirty nil
                   :draft-input ""
                   :main-buffer nil
                   :chat-buffer nil
