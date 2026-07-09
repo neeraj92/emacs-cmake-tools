@@ -1,11 +1,14 @@
 ;;; cursor-acp-ui.el --- Cursor ACP UI -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
+(require 'map)
+(require 'shell-maker)
+(unless (require 'markdown-overlays nil t)
+  (error "markdown-overlays not found; update shell-maker"))
 (require 'cursor-acp-core)
 
 (autoload 'markdown-mode "markdown-mode" nil t)
 (autoload 'gfm-mode "markdown-mode" nil t)
-(autoload 'gfm-view-mode "markdown-mode" nil t)
 
 (defvar-local cursor-acp--emulation-keys-on nil)
 
@@ -73,51 +76,52 @@
    "C-c C-w  switch session"
    "C-c C-l  show logs"
    "C-c C-i  show info"
-   "C-c C-p  focus input"
-   "RET      send (in input)"
-   "C-j      newline (in input)"
-   "TAB/C-i  toggle section"))
+   "C-c C-p  focus shell"
+   "RET      send (at comint prompt)"
+   "TAB/C-i  toggle section (in info buffer)"))
 
-(defun cursor-acp--input-text (sess)
-  (with-current-buffer (cursor-acp--session-input-buffer sess)
-    (string-trim-right (buffer-substring-no-properties (point-min) (point-max)))))
+;;; Shell-maker config and mode
 
-(defun cursor-acp--input-clear (sess)
-  (with-current-buffer (cursor-acp--session-input-buffer sess)
-    (let ((inhibit-read-only t))
-      (erase-buffer))))
+(defvar cursor-acp--shell-config
+  (make-shell-maker-config
+   :name "Cursor-ACP"
+   :execute-command
+   (lambda (input shell)
+     (message "Received the call here in the submit function")
+     (let ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                     (cursor-acp--active-session))))
+       (if sess
+	   (message "Session is fine")
+	 (message "Session is nil"))
+       (when sess
+         (setf (cursor-acp--session-shell-write-output sess) (map-elt shell :write-output))
+         (setf (cursor-acp--session-shell-finish-output sess) (map-elt shell :finish-output))
+         (cursor-acp--set-busy sess t)
+         (let ((sid (cursor-acp--ensure-connected-session sess)))
+           (cursor-acp--set-active-session-id sid)
+           (cursor-acp--rpc-send-async
+            sess "session/prompt"
+            `((sessionId . ,sid)
+              (prompt . [((type . "text") (text . ,input))]))
+            sid)))
+       ))
+   :on-command-finished
+   (lambda (_input _output _success)
+     (when cursor-acp-markdown-hide-markup
+       (markdown-overlays-put))))
+  "shell-maker config for cursor-acp sessions.")
 
-(defun cursor-acp--ensure-input-window-height (sess)
-  (let* ((buf (cursor-acp--session-input-buffer sess))
-         (win (and (buffer-live-p buf) (get-buffer-window buf t))))
-    (when (window-live-p win)
-      (let* ((frame-lines (frame-height (window-frame win)))
-             (target (max window-min-height
-                          (max 3 (floor (* (max 10 frame-lines) 0.10))))))
-        (cond
-         ((fboundp 'set-window-text-height)
-          (ignore-errors (set-window-text-height win target)))
-         (t
-          (let* ((cur (window-body-height win))
-                 (delta (- target cur)))
-            (when (/= delta 0)
-              (ignore-errors (window-resize win delta))))))))))
+(shell-maker-define-major-mode cursor-acp--shell-config)
+(define-key cursor-acp-shell-mode-map (kbd "C-<up>") #'scroll-up-line)
+(define-key cursor-acp-shell-mode-map (kbd "C-<down>") #'scroll-down-line)
 
-(defun cursor-acp--ensure-plan-window-height (sess)
-  (let* ((buf (cursor-acp--session-plan-buffer sess))
-         (win (and (buffer-live-p buf) (get-buffer-window buf t))))
-    (when (window-live-p win)
-      (let* ((frame-lines (frame-height (window-frame win)))
-             (target (max window-min-height
-                          (max 3 (floor (* (max 10 frame-lines) 0.10))))))
-        (cond
-         ((fboundp 'set-window-text-height)
-          (ignore-errors (set-window-text-height win target)))
-         (t
-          (let* ((cur (window-body-height win))
-                 (delta (- target cur)))
-            (when (/= delta 0)
-              (ignore-errors (window-resize win delta))))))))))
+(add-hook 'cursor-acp-shell-mode-hook
+          (lambda ()
+            (cursor-acp--enable-emulation-keys)
+            (add-hook 'completion-at-point-functions #'cursor-acp--at-file-capf nil t)
+            (add-hook 'post-self-insert-hook #'cursor-acp--maybe-trigger-at-file-completion nil t)))
+
+;;; Window layout helpers
 
 (defun cursor-acp--pane-window-p (win)
   (and (window-live-p win)
@@ -147,60 +151,61 @@
       (when (/= delta 0)
         (ignore-errors (window-resize win delta t t))))))
 
-(defun cursor-acp--ensure-pane (sess &optional force-width)
-  (let* ((chat (cursor-acp--session-chat-buffer sess))
-         (input (cursor-acp--session-input-buffer sess))
+(defun cursor-acp--ensure-plan-window-height (sess)
+  (let* ((buf (cursor-acp--session-plan-buffer sess))
+         (win (and (buffer-live-p buf) (get-buffer-window buf t))))
+    (when (window-live-p win)
+      (let* ((frame-lines (frame-height (window-frame win)))
+             (target (max window-min-height
+                          (max 3 (floor (* (max 10 frame-lines) 0.10))))))
+        (cond
+         ((fboundp 'set-window-text-height)
+          (ignore-errors (set-window-text-height win target)))
+         (t
+          (let* ((cur (window-body-height win))
+                 (delta (- target cur)))
+            (when (/= delta 0)
+              (ignore-errors (window-resize win delta))))))))))
+
+(defun cursor-acp--ensure-shell-pane (sess &optional force-width)
+  (let* ((buf (cursor-acp--session-shell-buffer sess))
          (plan (cursor-acp--session-plan-buffer sess))
-         (chat-win
+         (shell-win
           (or (cl-find-if
                #'cursor-acp--pane-window-p
-               (get-buffer-window-list chat nil t))
+               (get-buffer-window-list buf nil t))
               (display-buffer-in-side-window
-               chat
+               buf
                `((side . right)
                  (slot . 0)
                  (window-width . ,cursor-acp-pane-width)
                  (window-parameters . ((cursor-acp-pane . t))))))))
-    (when (window-live-p chat-win)
-      (set-window-parameter chat-win 'cursor-acp-pane t)
-      (set-window-dedicated-p chat-win t)
-      (cursor-acp--pane-allow-resize chat-win)
+    (when (window-live-p shell-win)
+      (set-window-parameter shell-win 'cursor-acp-pane t)
+      (set-window-dedicated-p shell-win t)
+      (cursor-acp--pane-allow-resize shell-win)
       (when force-width
-        (cursor-acp--pane-snap-width chat-win cursor-acp-pane-width))
-      (let ((input-win
-             (or (cl-find-if
-                  #'cursor-acp--pane-window-p
-                  (get-buffer-window-list input nil t))
-                 (display-buffer-in-side-window
-                  input
-                  `((side . right)
-                    (slot . ,(if (buffer-live-p plan) 2 1))
-                    (window-width . ,cursor-acp-pane-width)
-                    (window-height . 0.10)
-                    (window-parameters . ((cursor-acp-pane . t))))))))
-        (when (window-live-p input-win)
-          (set-window-parameter input-win 'cursor-acp-pane t)
-          (set-window-dedicated-p input-win t)
-          (cursor-acp--pane-allow-resize input-win)
-          (when (and (buffer-live-p plan) (cursor-acp--session-display-plan-buffer sess))
-            (let ((plan-win
-                   (or (cl-find-if
-                        #'cursor-acp--pane-window-p
-                        (get-buffer-window-list plan nil t))
-                       (display-buffer-in-side-window
-                        plan
-                        `((side . right)
-                          (slot . 1)
-                          (window-width . ,cursor-acp-pane-width)
-                          (window-height . 0.10)
-                          (window-parameters . ((cursor-acp-pane . t))))))))
-              (when (window-live-p plan-win)
-                (set-window-parameter plan-win 'cursor-acp-pane t)
-                (set-window-dedicated-p plan-win t)
-                (cursor-acp--pane-allow-resize plan-win)
-                (cursor-acp--ensure-plan-window-height sess))))
-          (cursor-acp--ensure-input-window-height sess)
-          (cons chat-win input-win))))))
+        (cursor-acp--pane-snap-width shell-win cursor-acp-pane-width))
+      (when (and (buffer-live-p plan) (cursor-acp--session-display-plan-buffer sess))
+        (let ((plan-win
+               (or (cl-find-if
+                    #'cursor-acp--pane-window-p
+                    (get-buffer-window-list plan nil t))
+                   (display-buffer-in-side-window
+                    plan
+                    `((side . right)
+                      (slot . 1)
+                      (window-width . ,cursor-acp-pane-width)
+                      (window-height . 0.10)
+                      (window-parameters . ((cursor-acp-pane . t))))))))
+          (when (window-live-p plan-win)
+            (set-window-parameter plan-win 'cursor-acp-pane t)
+            (set-window-dedicated-p plan-win t)
+            (cursor-acp--pane-allow-resize plan-win)
+            (cursor-acp--ensure-plan-window-height sess))))
+      shell-win)))
+
+;;; Plan buffer rendering
 
 (defun cursor-acp--format-plan-todo-line (entry)
   (let* ((content (and (hash-table-p entry) (cursor-acp--ht-get entry "content")))
@@ -251,151 +256,155 @@
         (goto-char (point-min))
         (setq-local buffer-read-only t)))
     (setf (cursor-acp--session-display-plan-buffer sess) t)
-    (cursor-acp--ensure-pane sess)
+    (cursor-acp--ensure-shell-pane sess)
     (cursor-acp--ensure-plan-window-height sess)))
 
-(defun cursor-acp--input-focus (sess)
-  (let ((buf (cursor-acp--session-input-buffer sess)))
+;;; Shell buffer management
+
+(defun cursor-acp--ensure-shell-buffer (sess)
+  "Ensure SESS has a live shell-maker buffer; create it if needed."
+  (let ((buf (cursor-acp--session-shell-buffer sess)))
+    (unless (buffer-live-p buf)
+      (message "Starting the shell maker")
+      (setq buf (shell-maker-start
+                 cursor-acp--shell-config
+                 t    ; no-focus — we control display ourselves
+                 nil  ; no welcome message
+                 nil  ; no new-session (we control buffer names)
+                 (cursor-acp--shell-buffer-name sess)))
+      (setf (cursor-acp--session-shell-buffer sess) buf)
+      (with-current-buffer buf
+        (setq-local header-line-format (cursor-acp--chat-header-line sess))))
+    buf))
+
+(defun cursor-acp--shell-focus (sess)
+  (let ((buf (cursor-acp--session-shell-buffer sess)))
     (when (buffer-live-p buf)
       (let ((win (or (get-buffer-window buf t)
-                     (cdr (cursor-acp--ensure-pane sess)))))
+                     (cursor-acp--ensure-shell-pane sess))))
         (when (window-live-p win)
           (select-window win)))
-      (cursor-acp--ensure-input-window-height sess)
-      (goto-char (point-max))
+      (with-current-buffer buf
+        (goto-char (point-max)))
       (when (and (featurep 'evil) (fboundp 'evil-insert-state))
         (evil-insert-state)))))
 
-(defun cursor-acp--chat-scroll-to-end (buf)
-  (when (buffer-live-p buf)
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (dolist (win (get-buffer-window-list buf nil t))
-        (when (window-live-p win)
-          (set-window-point win (point-max)))))))
-
-(defun cursor-acp--chat-append-raw (sess s)
-  "Append markdown string S to SESS's transcript accumulator."
-  (when (stringp s)
-    (setf (cursor-acp--session-transcript-text sess)
-          (concat (or (cursor-acp--session-transcript-text sess) "")
-                  (substring-no-properties s)))))
+;;; Chat output functions (write to the shell buffer via shell-maker)
 
 (defun cursor-acp--chat-insert (sess s &optional _read-only _face)
-  "Append S to the transcript and schedule a preview re-render.
-READ-ONLY and FACE are accepted for backward compatibility and ignored;
-styling now comes from the rendered HTML preview."
-  (cursor-acp--chat-append-raw sess s)
-  (cursor-acp--schedule-preview sess))
+  (when (and (stringp s) (cursor-acp--valid-session-p sess))
+    (let ((write-fn (cursor-acp--session-shell-write-output sess))
+          (buf (cursor-acp--session-shell-buffer sess)))
+      (cond
+       (write-fn
+        (funcall write-fn s))
+       ((buffer-live-p buf)
+        (with-current-buffer buf
+          (shell-maker-write-output :config cursor-acp--shell-config :output s)))))))
 
 (defun cursor-acp--chat-clear (sess)
-  (setf (cursor-acp--session-transcript-text sess) "")
-  (setf (cursor-acp--session-assistant-open sess) nil)
-  (setf (cursor-acp--session-assistant-frag sess) "")
-  (cursor-acp--schedule-preview sess))
+  (let ((buf (cursor-acp--session-shell-buffer sess)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (shell-maker-clear-buffer)))))
 
-(defun cursor-acp--chat-append-user (sess text)
-  (cursor-acp--chat-append-raw sess "\n\n")
-  (dolist (line (split-string (or text "") "\n" nil))
-    (cursor-acp--chat-append-raw sess (concat "> " line "\n")))
-  (cursor-acp--schedule-preview sess))
+(defun cursor-acp--chat-append-user (_sess _text)
+  ;; comint echoes user input automatically; no manual append needed
+  nil)
 
-(defun cursor-acp--chat-open-assistant (sess)
-  (unless (cursor-acp--session-assistant-open sess)
-    (setf (cursor-acp--session-assistant-open sess) t)
-    (cursor-acp--chat-append-raw sess "\n\n")))
+(defun cursor-acp--chat-open-assistant (_sess)
+  nil)
 
-(defun cursor-acp--assistant-flush-frag (sess)
-  "Flush any buffered assistant text without closing the assistant block."
-  (unless (string-empty-p (or (cursor-acp--session-assistant-frag sess) ""))
-    (cursor-acp--chat-append-raw sess (cursor-acp--session-assistant-frag sess))
-    (setf (cursor-acp--session-assistant-frag sess) "")
-    (cursor-acp--schedule-preview sess)))
+(defun cursor-acp--assistant-flush-frag (_sess)
+  nil)
 
 (defun cursor-acp--assistant-append (sess txt)
-  (setf (cursor-acp--session-assistant-frag sess)
-        (concat (or (cursor-acp--session-assistant-frag sess) "") (or txt "")))
-  (when (or (string-match-p "\n" (or txt ""))
-            (>= (cursor-acp--count-words (cursor-acp--session-assistant-frag sess))
-                cursor-acp-chat-flush-words))
-    (cursor-acp--assistant-flush-frag sess)))
+  (when-let ((fn (cursor-acp--session-shell-write-output sess)))
+    (when (stringp txt)
+      (funcall fn txt))))
 
 (defun cursor-acp--assistant-end-turn (sess)
-  (cursor-acp--assistant-flush-frag sess)
-  (setf (cursor-acp--session-assistant-open sess) nil)
-  (cursor-acp--chat-append-raw sess "\n\n")
-  (cursor-acp--session-transcript-save sess)
-  (cursor-acp--schedule-preview sess))
+  (let ((finish-fn (cursor-acp--session-shell-finish-output sess)))
+    (when finish-fn
+      (funcall finish-fn t)
+      (setf (cursor-acp--session-shell-write-output sess) nil)
+      (setf (cursor-acp--session-shell-finish-output sess) nil)))
+  (cursor-acp--session-transcript-save sess))
 
-(defvar cursor-acp--preview-pending nil
-  "Sessions whose chat preview needs a re-render.")
+(defun cursor-acp--schedule-preview (_sess)
+  nil)
 
-(defvar cursor-acp--preview-timer nil
-  "Idle timer coalescing chat preview re-renders.")
+(defun cursor-acp--shell-at-prompt-p ()
+  (let ((preg (shell-maker-prompt-regexp cursor-acp--shell-config)))
+    (and (stringp preg) (not (string-empty-p preg))
+         (save-excursion
+           (goto-char (point-max))
+           (forward-line 0)
+           (looking-at preg)))))
 
-(defvar-local cursor-acp--rendered-length 0
-  "Number of transcript characters already rendered into this chat buffer.")
-
-(defun cursor-acp--schedule-preview (sess)
-  "Mark SESS dirty and arrange a coalesced preview re-render when idle."
-  (when (cursor-acp--valid-session-p sess)
-    (setf (cursor-acp--session-preview-dirty sess) t)
-    (unless (memq sess cursor-acp--preview-pending)
-      (push sess cursor-acp--preview-pending))
-    (unless cursor-acp--preview-timer
-      (setq cursor-acp--preview-timer
-            (run-with-idle-timer 0 nil #'cursor-acp--preview-flush-pending)))))
-
-(defun cursor-acp--preview-flush-pending ()
-  (setq cursor-acp--preview-timer nil)
-  (let ((sessions cursor-acp--preview-pending))
-    (setq cursor-acp--preview-pending nil)
-    (dolist (s sessions)
-      (when (and (cursor-acp--valid-session-p s)
-                 (cursor-acp--session-preview-dirty s))
-        (setf (cursor-acp--session-preview-dirty s) nil)
-        (ignore-errors (cursor-acp--render-preview s))))))
-
-(defun cursor-acp--render-preview (sess)
-  "Render SESS's transcript into its chat buffer incrementally.
-If the buffer already holds a prefix of the current transcript, only
-the new suffix is appended and fontified, leaving existing buffer
-positions and their display properties untouched.  A full erase+insert
-is done only when the buffer no longer matches the transcript prefix
-(e.g. after `cursor-acp--chat-clear' or a session reload)."
-  (let ((buf (cursor-acp--session-chat-buffer sess)))
+(defun cursor-acp--shell-finalize-display (sess)
+  "Ensure SESS shell buffer has a comint prompt and markdown overlays."
+  (when-let ((buf (cursor-acp--session-shell-buffer sess)))
     (when (buffer-live-p buf)
-      (let ((md (or (cursor-acp--session-transcript-text sess) "")))
-        (with-current-buffer buf
-          (let* ((inhibit-read-only t)
-                 (already cursor-acp--rendered-length)
-                 (new-len (length md))
-                 (buf-size (buffer-size))
-                 (appendp (and (> new-len already)
-                               (= buf-size already))))
-            (cond
-             ((= new-len already))
-             (appendp
-              (let ((insert-start (point-max)))
-                (goto-char insert-start)
-                (insert (substring md already))
-                (setq cursor-acp--rendered-length new-len)
-                (when (and cursor-acp-preview-enabled
-                           (bound-and-true-p font-lock-mode)
-                           (fboundp 'font-lock-ensure))
-                  (ignore-errors
-                    (font-lock-ensure insert-start (point-max))))))
-             (t
-              (erase-buffer)
-              (insert md)
-              (setq cursor-acp--rendered-length new-len)
-              (when (and cursor-acp-preview-enabled
-                         (bound-and-true-p font-lock-mode)
-                         (fboundp 'font-lock-ensure))
-                (ignore-errors
-                  (font-lock-ensure (point-min) (point-max))))))))
-        (cursor-acp--session-transcript-save sess)
-        (cursor-acp--chat-scroll-to-end buf)))))
+      (with-current-buffer buf
+        (when (eq major-mode (shell-maker-major-mode cursor-acp--shell-config))
+          (unless (cursor-acp--shell-at-prompt-p)
+            (shell-maker-finish-output :config cursor-acp--shell-config :success t))
+          (when cursor-acp-markdown-hide-markup
+            (markdown-overlays-put)))))))
+
+(defvar cursor-acp--shell-finalize-timer nil)
+
+(defun cursor-acp--schedule-shell-finalize (sess &optional delay)
+  "After DELAY seconds of idle, finalize SESS shell display (prompt + overlays)."
+  (when (cursor-acp--valid-session-p sess)
+    (when cursor-acp--shell-finalize-timer
+      (cancel-timer cursor-acp--shell-finalize-timer))
+    (setq cursor-acp--shell-finalize-timer
+          (run-with-idle-timer (or delay 0.3) nil
+                               #'cursor-acp--shell-finalize-display sess))))
+
+(defun cursor-acp--session-transcript-restore (sess)
+  "Restore SESS shell buffer from the saved transcript file, if readable."
+  (when-let ((path (cursor-acp--session-transcript-file sess)))
+    (when (and (file-readable-p path) (cursor-acp--valid-session-p sess))
+      (cursor-acp--ensure-shell-buffer sess)
+      (let ((history
+             (with-temp-buffer
+               (insert-file-contents path)
+               (shell-maker--extract-history
+                (shell-maker-prompt-regexp cursor-acp--shell-config)
+                :propertized nil))))
+        (when history
+          (with-current-buffer (cursor-acp--session-shell-buffer sess)
+            (shell-maker-restore-session-from-transcript history))
+          t)))))
+
+;;; Info buffer rendering
+
+(defun cursor-acp--render-info (sess)
+  (let ((buf (cursor-acp--session-info-buffer sess)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (cursor-acp--status-line sess) "\n")
+          (insert (make-string (min 80 (window-body-width nil t)) ?-) "\n\n")
+          (cursor-acp--insert-section
+           sess "Keys" (cursor-acp--keys-items) "(no keys?)")
+          (insert "\n")
+          (cursor-acp--insert-section
+           sess "Modes" (cursor-acp--session-available-modes sess))
+          (insert "\n")
+          (cursor-acp--insert-section
+           sess "Models" (cursor-acp--session-available-models sess)
+           "(not advertised by ACP initialize)")
+          (insert "\n")
+          (cursor-acp--insert-section
+           sess "Commands" (cursor-acp--session-available-commands sess)
+           "(not advertised by ACP initialize)"))))))
+
+;;; Permission and ask-question UI (write inline to shell buffer)
 
 (defun cursor-acp--truncate (s maxlen)
   (let* ((s0 (if (stringp s) s (format "%s" (or s ""))))
@@ -513,6 +522,13 @@ is done only when the buffer no longer matches the transcript prefix
       (cursor-acp--chat-insert sess (format "%d. %s\n" (nth 0 p) (nth 1 p)) t))
     pairs))
 
+(defun cursor-acp--truncate-string (s maxlen)
+  (let ((s0 (if (stringp s) s (format "%s" (or s ""))))
+        (n (max 0 (or maxlen 0))))
+    (if (<= (length s0) n)
+        s0
+      (if (<= n 3) (substring s0 0 n) (concat (substring s0 0 (- n 3)) "...")))))
+
 (defun cursor-acp--ask-question-select-option-ids (prompt-prefix pairs allow-multiple)
   (unless pairs
     (user-error "Question has no options"))
@@ -611,12 +627,7 @@ is done only when the buffer no longer matches the transcript prefix
        t)
       `((outcome . "answered") (answers . ,answers)))))
 
-(defun cursor-acp--truncate-string (s maxlen)
-  (let ((s0 (if (stringp s) s (format "%s" (or s ""))))
-        (n (max 0 (or maxlen 0))))
-    (if (<= (length s0) n)
-        s0
-      (if (<= n 3) (substring s0 0 n) (concat (substring s0 0 (- n 3)) "...")))))
+;;; Tool call and diff rendering
 
 (defun cursor-acp--read-tool-kind-p (tool-kind)
   (let ((k (and (stringp tool-kind) (downcase (string-trim tool-kind)))))
@@ -718,41 +729,21 @@ is done only when the buffer no longer matches the transcript prefix
          (preview (cursor-acp--diff-preview diff))
          (txt (car preview))
          (remaining (cdr preview)))
-    (cursor-acp--chat-append-raw
+    (cursor-acp--chat-insert
      sess
-     (concat "\n\n**🔍 Diff: " p "**\n\n```diff\n" txt "```\n"))
+     (concat "\n\n**🔍 Diff: " p "**\n\n```diff\n" txt "```\n")
+     t)
     (when (> remaining 0)
-      (cursor-acp--chat-append-raw sess (format "_... (%d more lines)_\n" remaining)))
-    (cursor-acp--schedule-preview sess)))
+      (cursor-acp--chat-insert sess (format "_... (%d more lines)_\n" remaining) t))))
 
 (defun cursor-acp--render-write-text-file (sess path)
   (cursor-acp--assistant-flush-frag sess)
-  (cursor-acp--chat-append-raw
+  (cursor-acp--chat-insert
    sess
-   (concat "\n\n**📝 Wrote: " (or path "(unknown path)") "**\n"))
-  (cursor-acp--schedule-preview sess))
+   (concat "\n\n**📝 Wrote: " (or path "(unknown path)") "**\n")
+   t))
 
-(defun cursor-acp--render-info (sess)
-  (let ((buf (cursor-acp--session-info-buffer sess)))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert (cursor-acp--status-line sess) "\n")
-          (insert (make-string (min 80 (window-body-width nil t)) ?-) "\n\n")
-          (cursor-acp--insert-section
-           sess "Keys" (cursor-acp--keys-items) "(no keys?)")
-          (insert "\n")
-          (cursor-acp--insert-section
-           sess "Modes" (cursor-acp--session-available-modes sess))
-          (insert "\n")
-          (cursor-acp--insert-section
-           sess "Models" (cursor-acp--session-available-models sess)
-           "(not advertised by ACP initialize)")
-          (insert "\n")
-          (cursor-acp--insert-section
-           sess "Commands" (cursor-acp--session-available-commands sess)
-           "(not advertised by ACP initialize)"))))))
+;;; Major modes
 
 (defvar cursor-acp--global-keys-mode-map
   (let ((map (make-sparse-keymap)))
@@ -806,79 +797,7 @@ is done only when the buffer no longer matches the transcript prefix
     (define-key map (kbd "C-i") #'cursor-acp-toggle-section)
     map))
 
-(defvar cursor-acp-input-mode-map
-  (let ((map (copy-keymap text-mode-map)))
-    (define-key map (kbd "RET") #'cursor-acp-send)
-    (define-key map (kbd "C-j") #'newline)
-    (define-key map (kbd "SPC") #'cursor-acp--space)
-    (define-key map (kbd "C-c C-p") (lambda () (interactive) (cursor-acp--input-focus (cursor-acp--ensure-session))))
-    map))
-
-
-(define-derived-mode cursor-acp-input-mode text-mode "Cursor-ACP-Input"
-  "Major mode for Cursor ACP input buffer."
-  (setq-local truncate-lines nil)
-  (setq-local word-wrap t)
-  (cursor-acp--enable-emulation-keys)
-  (add-hook 'completion-at-point-functions #'cursor-acp--at-file-capf nil t)
-  (add-hook 'post-self-insert-hook #'cursor-acp--maybe-trigger-at-file-completion nil t))
-
-(defun cursor-acp--space (&optional n)
-  (interactive "p")
-  (let ((n (or n 1)))
-    (if (and (eq major-mode 'cursor-acp-input-mode)
-             (bound-and-true-p completion-in-region-mode)
-             (eq (char-before) ?@))
-        (progn
-          (completion-in-region-mode -1)
-          (self-insert-command n))
-      (self-insert-command n))))
-
-(defvar cursor-acp-chat-mode-map
-  (let ((map (copy-keymap text-mode-map)))
-    (define-key map (kbd "C-c C-s") #'cursor-acp-start)
-    (define-key map (kbd "C-c C-k") #'cursor-acp-stop)
-    (define-key map (kbd "C-c C-x") #'cursor-acp-cancel-turn)
-    (define-key map (kbd "C-c C-a") #'cursor-acp-reprompt-permission)
-    (define-key map (kbd "C-c C-b") #'cursor-acp-reprompt-ask-question)
-    (define-key map (kbd "C-c C-r") #'cursor-acp-reset-layout)
-    (define-key map (kbd "C-c C-l") #'cursor-acp-show-logs)
-    (define-key map (kbd "C-c C-i") #'cursor-acp-cycle-mode)
-    (define-key map (kbd "C-c C-d") #'cursor-acp-show-info)
-    (define-key map (kbd "C-c C-p") #'cursor-acp-focus-input)
-    (define-key map (kbd "C-c C-m") #'cursor-acp-switch-mode)
-    (define-key map (kbd "C-c C-M") #'cursor-acp-switch-model)
-    (define-key map (kbd "C-c C-/") #'cursor-acp-run-command)
-    map))
-
-(define-derived-mode cursor-acp-chat-mode gfm-view-mode "Cursor-ACP"
-  "Major mode for the Cursor ACP chat buffer.
-A read-only, fontified GFM view of the session transcript; the buffer
-is not edited directly."
-  (when (boundp 'markdown-mode-map)
-    (set-keymap-parent cursor-acp-chat-mode-map markdown-mode-map))
-  (setq-local truncate-lines nil)
-  (setq-local word-wrap t)
-  (setq-local markdown-hide-markup t)
-  (add-to-invisibility-spec 'markdown-markup)
-  (buffer-disable-undo)
-  (cursor-acp--enable-emulation-keys)
-  (let ((sess (cursor-acp--ensure-session)))
-    (setq-local header-line-format (cursor-acp--chat-header-line sess))))
-
-(with-eval-after-load 'evil
-  (when (fboundp 'evil-define-key)
-    (evil-define-key '(insert) cursor-acp-input-mode-map
-      (kbd "RET") #'cursor-acp-send
-      (kbd "C-j") #'newline)
-    (evil-define-key '(normal motion) cursor-acp-chat-mode-map
-      (kbd "C-c C-i") #'cursor-acp-cycle-mode
-      (kbd "C-c C-d") #'cursor-acp-show-info
-      (kbd "C-c C-p") #'cursor-acp-focus-input)
-    (evil-define-key '(insert) cursor-acp-chat-mode-map
-      (kbd "C-c C-i") #'cursor-acp-cycle-mode
-      (kbd "C-c C-d") #'cursor-acp-show-info
-      (kbd "C-c C-p") #'cursor-acp-focus-input)))
+;;; @-file completion (shared between shell and info buffers)
 
 (defun cursor-acp--path-has-hidden-component-p (path)
   (let* ((parts (split-string (directory-file-name path) "/" t)))
@@ -910,7 +829,7 @@ is not edited directly."
         (delete-region at-pos (1+ at-pos))))))
 
 (defun cursor-acp--at-file-capf ()
-  "Completion for workspace files after '@' in ACP input buffers."
+  "Completion for workspace files after '@' in ACP shell buffers."
   (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
                    (cursor-acp--active-session)
                    (cursor-acp--ensure-session)))
@@ -927,50 +846,45 @@ is not edited directly."
                 :exit-function #'cursor-acp--at-file-exit))))))
 
 (defun cursor-acp--maybe-trigger-at-file-completion ()
-  (when (and (eq major-mode 'cursor-acp-input-mode)
+  (when (and (derived-mode-p 'cursor-acp-shell-mode)
              (eq last-command-event ?@))
     (completion-at-point)))
+
+;;; Buffer identity helpers
 
 (defun cursor-acp--acp-buffer-p (sess buf)
   (and (buffer-live-p buf)
        (memq buf
-             (list (cursor-acp--session-chat-buffer sess)
-                   (cursor-acp--session-input-buffer sess)
+             (list (cursor-acp--session-shell-buffer sess)
                    (cursor-acp--session-info-buffer sess)
                    (cursor-acp--session-log-buffer sess)))))
 
 (defun cursor-acp--preferred-main-buffer ()
   (let* ((sess (cursor-acp--ensure-session))
-         (chat (cursor-acp--session-chat-buffer sess))
-         (input (cursor-acp--session-input-buffer sess))
+         (shell (cursor-acp--session-shell-buffer sess))
          (info (cursor-acp--session-info-buffer sess))
          (log (cursor-acp--session-log-buffer sess))
          (cur (window-buffer (selected-window))))
-    (if (memq cur (list chat input info log))
+    (if (memq cur (list shell info log))
         (or (cl-find-if
-             (lambda (b) (and (buffer-live-p b) (not (memq b (list chat input info log)))))
+             (lambda (b) (and (buffer-live-p b) (not (memq b (list shell info log)))))
              (buffer-list))
             (other-buffer cur t))
       cur)))
 
+;;; Open/close UI
+
 (defun cursor-acp--open-ui (sess &optional force-width)
+  (message "Loading up the cursor acp ui")
   (let ((cur (current-buffer)))
     (unless (cursor-acp--acp-buffer-p sess cur)
       (setf (cursor-acp--session-main-buffer sess) cur)))
-  (let* ((chat (cursor-acp--session-chat-buffer sess))
-         (input (cursor-acp--session-input-buffer sess))
-         (wins (cursor-acp--ensure-pane sess force-width))
-         (chat-win (car wins)))
-    (when (window-live-p chat-win)
-      (set-window-buffer chat-win chat))
-    (with-current-buffer chat
-      (unless (derived-mode-p 'cursor-acp-chat-mode)
-        (cursor-acp-chat-mode))
-      (setq-local header-line-format (cursor-acp--chat-header-line sess)))
-    (with-current-buffer input
-      (cursor-acp-input-mode))
-    (cursor-acp--render-preview sess)
-    (cursor-acp--input-focus sess)))
+  (cursor-acp--ensure-shell-buffer sess)
+  (let* ((shell-buf (cursor-acp--session-shell-buffer sess))
+         (shell-win (cursor-acp--ensure-shell-pane sess force-width)))
+    (when (window-live-p shell-win)
+      (set-window-buffer shell-win shell-buf))
+    (cursor-acp--shell-focus sess)))
 
 (provide 'cursor-acp-ui)
 ;;; cursor-acp-ui.el ends here

@@ -91,14 +91,11 @@
   ask-question-tool-call-id
   ask-question-request-params
   ask-question-response-cache
-  assistant-frag
-  transcript-text
-  assistant-open
-  preview-dirty
   draft-input
   main-buffer
-  chat-buffer
-  input-buffer
+  shell-buffer
+  shell-write-output
+  shell-finish-output
   info-buffer
   log-buffer)
 
@@ -235,22 +232,18 @@ and markup is hidden. When nil, the raw markdown text is shown."
              (let ((sid (cursor-acp--session-session-id sess)))
                (and (stringp sid) (not (string-empty-p sid)))))
     (when-let ((path (cursor-acp--session-transcript-file sess)))
-      (let ((text (string-trim (or (cursor-acp--session-transcript-text sess) ""))))
-        (unless (string-empty-p text)
+      (let* ((buf (cursor-acp--session-shell-buffer sess))
+             (text (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (buffer-substring-no-properties (point-min) (point-max))))))
+        (when (and (stringp text) (not (string-empty-p (string-trim text))))
           (let ((dir (file-name-directory path)))
             (when (and (stringp dir) (not (file-directory-p dir)))
               (make-directory dir t))
             (write-region text nil path nil 'quiet)))))))
 
-(defun cursor-acp--session-transcript-load-into-chat (sess)
-  (when-let ((path (cursor-acp--session-transcript-file sess)))
-    (when (file-readable-p path)
-      (setf (cursor-acp--session-transcript-text sess)
-            (with-temp-buffer
-              (insert-file-contents path)
-              (buffer-string)))
-      (setf (cursor-acp--session-assistant-open sess) nil)
-      t)))
+(defun cursor-acp--session-transcript-load-into-chat (_sess)
+  nil)
 
 (defun cursor-acp--review-seed-path (sess abs-path)
   (let* ((root (cursor-acp--workspace-root sess))
@@ -346,22 +339,17 @@ and markup is hidden. When nil, the raw markdown text is shown."
   (let ((t0 (string-trim (or (cursor-acp--session-title sess) ""))))
     (if (string-empty-p t0) "Untitled" t0)))
 
-(defun cursor-acp--chat-buffer-name (sess)
+(defun cursor-acp--shell-buffer-name (sess)
   (format "*cursor-acp: %s*" (cursor-acp--session-buffer-title sess)))
-
-(defun cursor-acp--input-buffer-name (sess)
-  (format "*cursor-acp-input: %s*" (cursor-acp--session-buffer-title sess)))
 
 (defun cursor-acp--rename-session-buffers (sess)
   (when (cursor-acp--valid-session-p sess)
-    (when-let ((chat (cursor-acp--session-chat-buffer sess)))
-      (when (buffer-live-p chat)
-        (with-current-buffer chat
-          (rename-buffer (generate-new-buffer-name (cursor-acp--chat-buffer-name sess)) t))))
-    (when-let ((input (cursor-acp--session-input-buffer sess)))
-      (when (buffer-live-p input)
-        (with-current-buffer input
-          (rename-buffer (generate-new-buffer-name (cursor-acp--input-buffer-name sess)) t))))))
+    (when-let ((shell (cursor-acp--session-shell-buffer sess)))
+      (when (buffer-live-p shell)
+        (with-current-buffer shell
+          (rename-buffer (generate-new-buffer-name (cursor-acp--shell-buffer-name sess)) t)
+          (when (boundp 'shell-maker--buffer-name-override)
+            (setq-local shell-maker--buffer-name-override (buffer-name))))))))
 
 (defun cursor-acp--session-by-id (session-id)
   (when (and (stringp session-id) (not (string-empty-p session-id)))
@@ -409,14 +397,11 @@ and markup is hidden. When nil, the raw markdown text is shown."
                   :ask-question-tool-call-id nil
                   :ask-question-request-params nil
                   :ask-question-response-cache (make-hash-table :test #'equal)
-                  :assistant-frag ""
-                  :transcript-text ""
-                  :assistant-open nil
-                  :preview-dirty nil
                   :draft-input ""
                   :main-buffer nil
-                  :chat-buffer nil
-                  :input-buffer nil
+                  :shell-buffer nil
+                  :shell-write-output nil
+                  :shell-finish-output nil
                   :info-buffer nil
                   :log-buffer nil))
       (cursor-acp--ui-set-expanded sess "Keys" t)
@@ -476,8 +461,7 @@ and markup is hidden. When nil, the raw markdown text is shown."
   (setf (cursor-acp--session-create-plan-path sess) nil)
   (let ((sid (cursor-acp--session-session-id sess))
         (tab (cursor-acp--ensure-sessions-table)))
-    (dolist (buf (list (ignore-errors (cursor-acp--session-chat-buffer sess))
-                       (ignore-errors (cursor-acp--session-input-buffer sess))
+    (dolist (buf (list (ignore-errors (cursor-acp--session-shell-buffer sess))
                        (ignore-errors (cursor-acp--session-plan-buffer sess))))
       (when (buffer-live-p buf)
         (ignore-errors (kill-buffer buf))))
@@ -487,14 +471,13 @@ and markup is hidden. When nil, the raw markdown text is shown."
   (cursor-acp--session-by-id cursor-acp--active-session-id))
 
 (defun cursor-acp--session-for-buffer (buf)
-  "Return the session that owns BUF (chat/input/plan/info/log), else nil."
+  "Return the session that owns BUF (shell/plan/info/log), else nil."
   (when (and (buffer-live-p buf) (hash-table-p cursor-acp--sessions))
     (catch 'found
       (maphash
        (lambda (_k sess)
          (when (and (cursor-acp--valid-session-p sess)
-                    (memq buf (list (cursor-acp--session-chat-buffer sess)
-                                    (cursor-acp--session-input-buffer sess)
+                    (memq buf (list (cursor-acp--session-shell-buffer sess)
                                     (cursor-acp--session-plan-buffer sess)
                                     (cursor-acp--session-info-buffer sess)
                                     (cursor-acp--session-log-buffer sess))))
@@ -523,8 +506,7 @@ and markup is hidden. When nil, the raw markdown text is shown."
      (lambda (_sid sess)
        (when-let ((tmr (ignore-errors (cursor-acp--session-spinner-timer sess))))
          (ignore-errors (cancel-timer tmr)))
-       (dolist (buf (list (ignore-errors (cursor-acp--session-chat-buffer sess))
-                          (ignore-errors (cursor-acp--session-input-buffer sess))
+       (dolist (buf (list (ignore-errors (cursor-acp--session-shell-buffer sess))
                           (ignore-errors (cursor-acp--session-plan-buffer sess))
                           (ignore-errors (cursor-acp--session-info-buffer sess))
                           (ignore-errors (cursor-acp--session-log-buffer sess))))
@@ -543,7 +525,7 @@ and markup is hidden. When nil, the raw markdown text is shown."
              (cursor-acp--session-current-mode sess)
              (cursor-acp--session-available-commands sess)
              (cursor-acp--session-ui-expanded sess)
-             (cursor-acp--session-chat-buffer sess)
+             (cursor-acp--session-shell-buffer sess)
              (cursor-acp--session-log-buffer sess)
              t)
          (error nil))))
@@ -554,17 +536,9 @@ and markup is hidden. When nil, the raw markdown text is shown."
       (puthash section expanded h))))
 
 (defun cursor-acp--ensure-session-buffers (sess)
-  (let ((chat (cursor-acp--session-chat-buffer sess))
-        (input (cursor-acp--session-input-buffer sess))
-        (plan (cursor-acp--session-plan-buffer sess))
+  (let ((plan (cursor-acp--session-plan-buffer sess))
         (info (cursor-acp--session-info-buffer sess))
         (log (cursor-acp--session-log-buffer sess)))
-    (unless (buffer-live-p chat)
-      (setf (cursor-acp--session-chat-buffer sess)
-            (cursor-acp--ensure-unique-buffer (cursor-acp--chat-buffer-name sess))))
-    (unless (buffer-live-p input)
-      (setf (cursor-acp--session-input-buffer sess)
-            (cursor-acp--ensure-unique-buffer (cursor-acp--input-buffer-name sess))))
     (when (and plan (not (buffer-live-p plan)))
       (setf (cursor-acp--session-plan-buffer sess) nil))
     (unless (buffer-live-p info)
@@ -622,14 +596,11 @@ and markup is hidden. When nil, the raw markdown text is shown."
                   :ask-question-tool-call-id nil
                   :ask-question-request-params nil
                   :ask-question-response-cache (make-hash-table :test #'equal)
-                  :assistant-frag ""
-                  :transcript-text ""
-                  :assistant-open nil
-                  :preview-dirty nil
                   :draft-input ""
                   :main-buffer nil
-                  :chat-buffer nil
-                  :input-buffer nil
+                  :shell-buffer nil
+                  :shell-write-output nil
+                  :shell-finish-output nil
                   :info-buffer nil
                   :log-buffer nil))
       (cursor-acp--ui-set-expanded sess "Keys" t)
@@ -711,7 +682,7 @@ and markup is hidden. When nil, the raw markdown text is shown."
 
 (defun cursor-acp--chat-refresh-header (sess)
   (when (cursor-acp--valid-session-p sess)
-    (when-let ((buf (cursor-acp--session-chat-buffer sess)))
+    (when-let ((buf (cursor-acp--session-shell-buffer sess)))
       (when (buffer-live-p buf)
         (with-current-buffer buf
           (setq-local header-line-format (cursor-acp--chat-header-line sess)))))))

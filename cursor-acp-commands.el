@@ -74,33 +74,18 @@
          (sess (or (cursor-acp--session-for-buffer buf)
                    (cursor-acp--active-session)
                    (cursor-acp--ensure-session))))
-    (cursor-acp--input-focus sess)))
+    (cursor-acp--shell-focus sess)))
 
 (defun cursor-acp-send ()
+  "Submit the current comint input line in the cursor-acp shell buffer."
   (interactive)
-  (let* ((buf (current-buffer))
-         (sess (or (cursor-acp--session-for-buffer buf)
+  (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
                    (cursor-acp--active-session)
                    (cursor-acp--ensure-session)))
-         (text (if (eq buf (cursor-acp--session-input-buffer sess))
-                   (string-trim-right (buffer-substring-no-properties (point-min) (point-max)))
-                 (cursor-acp--input-text sess))))
-    (when (string-empty-p (string-trim text))
-      (user-error "Input is empty"))
-    (if (eq buf (cursor-acp--session-input-buffer sess))
-        (let ((inhibit-read-only t)) (erase-buffer))
-      (cursor-acp--input-clear sess))
-    (cursor-acp--chat-append-user sess text)
-    (cursor-acp--chat-open-assistant sess)
-    (cursor-acp--set-busy sess t)
-    (let ((sid (cursor-acp--ensure-connected-session sess)))
-      (cursor-acp--set-active-session-id sid)
-      (cursor-acp--rpc-send-async
-       sess "session/prompt"
-       `((sessionId . ,sid)
-         (prompt . [((type . "text") (text . ,text))]))
-       sid))
-    (cursor-acp--input-focus sess)))
+         (buf (cursor-acp--session-shell-buffer sess)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (comint-send-input)))))
 
 (defun cursor-acp-cancel-turn ()
   "Request cancellation of the current ACP turn."
@@ -173,7 +158,7 @@
           (delete-window win))))
 
     (setf (cursor-acp--session-display-plan-buffer sess) (not display))
-    (cursor-acp--ensure-pane sess)))
+    (cursor-acp--ensure-shell-pane sess)))
 
 (defun cursor-acp-new-session ()
   "Create a new ACP session and switch UI to it."
@@ -194,7 +179,6 @@
         (cursor-acp--session-transcript-save prev)
         (cursor-acp--set-active-session-id sid)
         (cursor-acp--cache-session-new target res)
-        (cursor-acp--chat-clear target)
         (cursor-acp-reset-layout)
         (cursor-acp--render-info target)))))
 
@@ -223,18 +207,16 @@
   (pop-to-buffer (cursor-acp--session-log-buffer (cursor-acp--ensure-session))))
 
 (defun cursor-acp-hide ()
-  "Hide Cursor ACP UI windows (chat/input pane) in the current frame."
+  "Hide Cursor ACP UI windows (shell pane) in the current frame."
   (interactive)
   (let* ((sess (or (cursor-acp--session-for-buffer (current-buffer))
                    (cursor-acp--active-session)
                    (cursor-acp--ensure-session)))
-         (chat (cursor-acp--session-chat-buffer sess))
-         (input (cursor-acp--session-input-buffer sess)))
-    (dolist (buf (list chat input))
-      (when (buffer-live-p buf)
-        (dolist (w (get-buffer-window-list buf nil t))
-          (when (window-live-p w)
-            (ignore-errors (delete-window w))))))
+         (shell (cursor-acp--session-shell-buffer sess)))
+    (when (buffer-live-p shell)
+      (dolist (w (get-buffer-window-list shell nil t))
+        (when (window-live-p w)
+          (ignore-errors (delete-window w)))))
     (cursor-acp--delete-pane-windows (selected-frame))))
 
 (defun cursor-acp--mode-cycle-ids (sess opt)
@@ -456,13 +438,15 @@
         (cursor-acp--set-active-session-id sid)
         (cursor-acp--ensure-session-buffers target)
         (cursor-acp-reset-layout)
-        (cursor-acp--chat-clear target)
-        (cursor-acp--session-transcript-load-into-chat target)
-        (cursor-acp--schedule-preview target)
         (if (cursor-acp--cap-load-session-p)
-            (cursor-acp--rpc-session-load target sid)
-          (when (cursor-acp--cap-session-resume-p)
-            (cursor-acp--rpc-session-resume target sid)))))))
+            (progn
+              (cursor-acp--rpc-session-load target sid)
+              (cursor-acp--schedule-shell-finalize target 0.5))
+          (progn
+            (when (cursor-acp--cap-session-resume-p)
+              (cursor-acp--rpc-session-resume target sid))
+            (cursor-acp--session-transcript-restore target)
+            (cursor-acp--shell-finalize-display target)))))))
 
 (defun cursor-acp-reset-layout ()
   "Restore the ACP right-side pane (chat + input) in the current frame."
