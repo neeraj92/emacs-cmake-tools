@@ -96,6 +96,7 @@
        (when sess
          (setf (cursor-acp--session-shell-write-output sess) (map-elt shell :write-output))
          (setf (cursor-acp--session-shell-finish-output sess) (map-elt shell :finish-output))
+         (cursor-acp--shell-reset-stream-state sess)
          (cursor-acp--set-busy sess t)
          (let ((sid (cursor-acp--ensure-connected-session sess)))
            (cursor-acp--set-active-session-id sid)
@@ -107,8 +108,14 @@
        ))
    :on-command-finished
    (lambda (_input _output _success)
-     (when cursor-acp-markdown-hide-markup
-       (markdown-overlays-put))))
+     (let ((sess (or (cursor-acp--session-for-buffer (current-buffer))
+                     (cursor-acp--active-session))))
+       (when sess
+         (cursor-acp--shell-reset-stream-state sess))
+       (if sess
+           (cursor-acp--shell-put-markdown-overlays sess)
+         (when cursor-acp-markdown-hide-markup
+           (markdown-overlays-put))))))
   "shell-maker config for cursor-acp sessions.")
 
 (shell-maker-define-major-mode cursor-acp--shell-config)
@@ -291,16 +298,74 @@
 
 ;;; Chat output functions (write to the shell buffer via shell-maker)
 
-(defun cursor-acp--chat-insert (sess s &optional _read-only _face)
-  (when (and (stringp s) (cursor-acp--valid-session-p sess))
+(defvar cursor-acp--shell-overlay-timers (make-hash-table :test #'eq))
+
+(defun cursor-acp--chat-flush-word-threshold ()
+  (max 1 (or cursor-acp-chat-flush-words 25)))
+
+(defun cursor-acp--shell-put-markdown-overlays (sess &optional redisplay-p)
+  (when cursor-acp-markdown-hide-markup
+    (when-let ((buf (cursor-acp--session-shell-buffer sess)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when (eq major-mode (shell-maker-major-mode cursor-acp--shell-config))
+            (markdown-overlays-put)
+            (when redisplay-p
+              (redisplay t))))))))
+
+(defun cursor-acp--shell-put-markdown-overlays-debounced (sess)
+  (remhash sess cursor-acp--shell-overlay-timers)
+  (cursor-acp--shell-put-markdown-overlays sess t))
+
+(defun cursor-acp--cancel-shell-markdown-overlay-timer (sess)
+  (when-let ((tmr (gethash sess cursor-acp--shell-overlay-timers)))
+    (ignore-errors (cancel-timer tmr))
+    (remhash sess cursor-acp--shell-overlay-timers)))
+
+(defun cursor-acp--schedule-shell-markdown-overlays (sess &optional delay)
+  (when (cursor-acp--valid-session-p sess)
+    (cursor-acp--cancel-shell-markdown-overlay-timer sess)
+    (puthash sess
+             (run-with-idle-timer (or delay 0) nil
+                                  #'cursor-acp--shell-put-markdown-overlays-debounced
+                                  sess)
+             cursor-acp--shell-overlay-timers)))
+
+(defun cursor-acp--shell-reset-overlay-word-count (sess)
+  (when (cursor-acp--valid-session-p sess)
+    (setf (cursor-acp--session-shell-overlay-words-since-refresh sess) 0)))
+
+(defun cursor-acp--shell-reset-stream-state (sess)
+  (when (cursor-acp--valid-session-p sess)
+    (setf (cursor-acp--session-assistant-frag sess) "")
+    (cursor-acp--shell-reset-overlay-word-count sess)
+    (cursor-acp--cancel-shell-markdown-overlay-timer sess)))
+
+(defun cursor-acp--shell-write-output (sess text)
+  (when (and (stringp text) (cursor-acp--valid-session-p sess))
     (let ((write-fn (cursor-acp--session-shell-write-output sess))
           (buf (cursor-acp--session-shell-buffer sess)))
       (cond
        (write-fn
-        (funcall write-fn s))
+        (funcall write-fn text))
        ((buffer-live-p buf)
         (with-current-buffer buf
-          (shell-maker-write-output :config cursor-acp--shell-config :output s)))))))
+          (shell-maker-write-output :config cursor-acp--shell-config :output text)))))))
+
+(defun cursor-acp--shell-write-and-track-overlays (sess text)
+  (when (and (stringp text) (cursor-acp--valid-session-p sess))
+    (cursor-acp--shell-write-output sess text)
+    (let* ((threshold (cursor-acp--chat-flush-word-threshold))
+           (n (cursor-acp--count-words text))
+           (count (+ (or (cursor-acp--session-shell-overlay-words-since-refresh sess) 0) n)))
+      (while (>= count threshold)
+        (cursor-acp--schedule-shell-markdown-overlays sess 0)
+        (setq count (- count threshold)))
+      (setf (cursor-acp--session-shell-overlay-words-since-refresh sess) count))))
+
+(defun cursor-acp--chat-insert (sess s &optional _read-only _face)
+  (when (and (stringp s) (cursor-acp--valid-session-p sess))
+    (cursor-acp--shell-write-and-track-overlays sess s)))
 
 (defun cursor-acp--chat-clear (sess)
   (let ((buf (cursor-acp--session-shell-buffer sess)))
@@ -315,15 +380,29 @@
 (defun cursor-acp--chat-open-assistant (_sess)
   nil)
 
-(defun cursor-acp--assistant-flush-frag (_sess)
-  nil)
+(defun cursor-acp--assistant-flush-frag (sess)
+  (when (cursor-acp--valid-session-p sess)
+    (let ((frag (or (cursor-acp--session-assistant-frag sess) "")))
+      (unless (string-empty-p frag)
+        (cursor-acp--shell-write-output sess frag)
+        (setf (cursor-acp--session-assistant-frag sess) "")
+        (cursor-acp--schedule-shell-markdown-overlays sess 0)))))
 
 (defun cursor-acp--assistant-append (sess txt)
-  (when-let ((fn (cursor-acp--session-shell-write-output sess)))
-    (when (stringp txt)
-      (funcall fn txt))))
+  (when (and (stringp txt) (cursor-acp--valid-session-p sess))
+    (setf (cursor-acp--session-assistant-frag sess)
+          (concat (or (cursor-acp--session-assistant-frag sess) "") txt))
+    (let ((threshold (cursor-acp--chat-flush-word-threshold)))
+      (while (>= (cursor-acp--count-words (cursor-acp--session-assistant-frag sess))
+                 threshold)
+        (let ((frag (cursor-acp--session-assistant-frag sess)))
+          (cursor-acp--shell-write-output sess frag)
+          (setf (cursor-acp--session-assistant-frag sess) "")
+          (cursor-acp--schedule-shell-markdown-overlays sess 0))))))
 
 (defun cursor-acp--assistant-end-turn (sess)
+  (cursor-acp--assistant-flush-frag sess)
+  (cursor-acp--cancel-shell-markdown-overlay-timer sess)
   (let ((finish-fn (cursor-acp--session-shell-finish-output sess)))
     (when finish-fn
       (funcall finish-fn t)
@@ -350,8 +429,7 @@
         (when (eq major-mode (shell-maker-major-mode cursor-acp--shell-config))
           (unless (cursor-acp--shell-at-prompt-p)
             (shell-maker-finish-output :config cursor-acp--shell-config :success t))
-          (when cursor-acp-markdown-hide-markup
-            (markdown-overlays-put)))))))
+          (cursor-acp--shell-put-markdown-overlays sess))))))
 
 (defvar cursor-acp--shell-finalize-timer nil)
 

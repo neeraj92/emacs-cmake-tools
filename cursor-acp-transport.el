@@ -480,6 +480,7 @@ the session's main buffer `default-directory' when available, else global
       (setf (cursor-acp--session-permission-request-params sess) params)
       (cursor-acp--set-awaiting-permission sess t)
       (cursor-acp--assistant-flush-frag sess)
+      (cursor-acp--shell-put-markdown-overlays sess)
       (condition-case _
           (let ((outcome (cursor-acp--prompt-permission-decision sess params))
                 (ids (cursor-acp--session-permission-request-ids sess)))
@@ -518,6 +519,7 @@ the session's main buffer `default-directory' when available, else global
         (params (cursor-acp--session-permission-request-params sess)))
     (unless (and rid (hash-table-p params))
       (user-error "No pending permission request"))
+    (cursor-acp--shell-put-markdown-overlays sess)
     (let* ((tool-call-id (cursor-acp--session-permission-tool-call-id sess))
            (cache (cursor-acp--session-permission-response-cache sess))
            (ids (or (cursor-acp--session-permission-request-ids sess) (list rid)))
@@ -565,6 +567,7 @@ the session's main buffer `default-directory' when available, else global
       (setf (cursor-acp--session-ask-question-request-params sess) params)
       (cursor-acp--set-awaiting-ask-question sess t)
       (cursor-acp--assistant-flush-frag sess)
+      (cursor-acp--shell-put-markdown-overlays sess)
       (condition-case _
           (let ((outcome (cursor-acp--prompt-ask-question-decision sess params))
                 (ids (cursor-acp--session-ask-question-request-ids sess)))
@@ -603,6 +606,7 @@ the session's main buffer `default-directory' when available, else global
         (params (cursor-acp--session-ask-question-request-params sess)))
     (unless (and (integerp rid) (hash-table-p params))
       (user-error "No pending ask question request"))
+    (cursor-acp--shell-put-markdown-overlays sess)
     (let* ((tool-call-id (cursor-acp--session-ask-question-tool-call-id sess))
            (cache (cursor-acp--session-ask-question-response-cache sess))
            (ids (or (cursor-acp--session-ask-question-request-ids sess) (list rid)))
